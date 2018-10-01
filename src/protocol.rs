@@ -1,7 +1,7 @@
 use merlin::Transcript;
-use pairing::{CurveAffine, CurveProjective, Engine, Field, PrimeField};
+use pairing::{CurveAffine, CurveProjective, Engine, Field};
 use srs::SRS;
-use util::{kate_divison, multiexp, multiply_polynomials, ChainExt, OptionExt, TranscriptProtocol};
+use util::{kate_divison, multiexp, multiply_polynomials, ChainExt, TranscriptProtocol};
 use {Circuit, ConstraintSystem, LinearCombination, SynthesisError, Variable};
 
 pub struct Proof<E: Engine> {
@@ -30,7 +30,7 @@ pub struct Precomp {
 }
 
 impl Precomp {
-    fn new<E: Engine, C: Circuit<E>>(circuit: &C) -> Result<Self, SynthesisError> {
+    pub fn new<E: Engine, C: Circuit<E>>(circuit: &C) -> Result<Self, SynthesisError> {
         struct Temp {
             n: usize,
         }
@@ -545,7 +545,7 @@ impl<E: Engine> KYEval<E> {
     }
 
     /// Returns (s_negative, s_positive, k_y)
-    fn finalize(mut self) -> E::Fr {
+    fn finalize(self) -> E::Fr {
         self.k_y
     }
 }
@@ -713,6 +713,8 @@ fn circuit_test() {
         }
     }
 
+    use util::OptionExt;
+    use pairing::PrimeField;
     use pairing::bls12_381::{Bls12, Fr};
 
     let srs_x = Fr::from_str("23923").unwrap();
