@@ -3,4 +3,6 @@ name = "sonic"
 version = "0.1.0"
 authors = ["Knuckles"]
 
-[dependencies]
+[dependencies.pairing]
+version = "0.14"
+features = ["u128-support"]
