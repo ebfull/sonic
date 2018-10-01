@@ -75,6 +75,7 @@ pub fn verify_proof<E: Engine, C: Circuit<E>>(
     srs: &SRS<E>,
     proof: &Proof<E>,
     precomp: &Precomp,
+    check_s_x: bool
 ) -> Result<(), SynthesisError> {
     let mut transcript = Transcript::new(&[]);
 
@@ -187,9 +188,32 @@ pub fn verify_proof<E: Engine, C: Circuit<E>>(
 
     // Compute s(X, y)
     let mut k_y = {
-        let mut s_eval = KYEval::new(y, precomp.n);
-        circuit.synthesize(&mut s_eval)?;
-        s_eval.finalize()
+        if check_s_x {
+            let (s_poly_negative, s_poly_positive, k_y) = {
+                let mut s_eval = SEval::new(y, precomp.n);
+                circuit.synthesize(&mut s_eval)?;
+                s_eval.finalize()
+            };
+
+            let mut expected_sv = E::Fr::zero();
+            let mut tmp = E::Fr::one();
+            for s in s_poly_negative.iter().rev().chain(Some(&E::Fr::zero())).chain(s_poly_positive.iter()) {
+                let mut s = *s;
+                s.mul_assign(&tmp);
+                expected_sv.add_assign(&s);
+                tmp.mul_assign(&z);
+            }
+
+            if proof.sv != expected_sv {
+                return Err(SynthesisError::Violation);
+            }
+
+            k_y
+        } else {
+            let mut s_eval = KYEval::new(y, precomp.n);
+            circuit.synthesize(&mut s_eval)?;
+            s_eval.finalize()
+        }
     };
 
     // the important check
@@ -300,6 +324,8 @@ pub fn create_proof<E: Engine, C: Circuit<E>>(
 
     // TODO: we can't have more wires than the SRS supports
     let n = wires.a.len();
+
+    println!("gates: {}", n);
 
     // Construct the transcript with the verifier
     let mut transcript = Transcript::new(&[]);
@@ -733,7 +759,7 @@ fn circuit_test() {
 
     let proof = create_proof::<Bls12, _>(&MyCircuit { x: Some(x), r: x3 }, &srs).unwrap();
 
-    verify_proof::<Bls12, _>(&MyCircuit { x: None, r: x3 }, &srs, &proof, &precomp).unwrap();
+    verify_proof::<Bls12, _>(&MyCircuit { x: None, r: x3 }, &srs, &proof, &precomp, false).unwrap();
 
     // let r = Fr::from_str("3948349").unwrap();
 
