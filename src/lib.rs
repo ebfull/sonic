@@ -2,6 +2,7 @@ extern crate merlin;
 extern crate pairing;
 
 pub mod util;
+pub mod srs;
 
 use pairing::{Engine, Field};
 use std::ops::{Add, Sub};
