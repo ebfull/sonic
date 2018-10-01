@@ -1,7 +1,10 @@
+extern crate merlin;
 extern crate pairing;
 
-use std::ops::{Add, Sub};
+pub mod util;
+
 use pairing::{Engine, Field};
+use std::ops::{Add, Sub};
 
 #[derive(Copy, Clone, Debug)]
 pub enum SynthesisError {

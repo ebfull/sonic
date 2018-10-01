@@ -6,3 +6,6 @@ authors = ["Knuckles"]
 [dependencies.pairing]
 version = "0.14"
 features = ["u128-support"]
+
+[dependencies]
+merlin = "0.2"
