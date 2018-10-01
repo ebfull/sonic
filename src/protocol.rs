@@ -13,6 +13,7 @@ pub struct Proof<E: Engine> {
     r1_prime: E::G2Affine,
     s: E::G1Affine,
     sx: E::G1Affine,
+    sx_prime: E::G2Affine,
     a1: E::G1Affine,
     comr_quotient: E::G1Affine,
     r1_quotient: E::G1Affine,
@@ -86,6 +87,7 @@ pub fn verify_proof<E: Engine, C: Circuit<E>>(
 
     transcript.commit_point(&proof.s);
     transcript.commit_point(&proof.sx);
+    transcript.commit_point(&proof.sx_prime);
     transcript.commit_point(&proof.a1);
     transcript.commit_point(&proof.r1);
     transcript.commit_point(&proof.r1_prime);
@@ -177,6 +179,12 @@ pub fn verify_proof<E: Engine, C: Circuit<E>>(
         return Err(SynthesisError::Violation);
     }
 
+    if proof.sx.pairing_with(&E::G2Affine::one())
+        != proof.sx_prime.pairing_with(&E::G1Affine::one())
+    {
+        return Err(SynthesisError::Violation);
+    }
+
     // Compute s(X, y)
     let mut k_y = {
         let mut s_eval = KYEval::new(y, precomp.n);
@@ -184,6 +192,7 @@ pub fn verify_proof<E: Engine, C: Circuit<E>>(
         s_eval.finalize()
     };
 
+    // the important check
     {
         k_y.double();
         k_y.negate();
@@ -229,6 +238,7 @@ pub fn create_proof<E: Engine, C: Circuit<E>>(
         r1_prime: E::G2Affine::zero(),
         s: E::G1Affine::zero(),
         sx: E::G1Affine::zero(),
+        sx_prime: E::G2Affine::zero(),
         a1: E::G1Affine::zero(),
         comr_quotient: E::G1Affine::zero(),
         r1_quotient: E::G1Affine::zero(),
@@ -360,6 +370,15 @@ pub fn create_proof<E: Engine, C: Circuit<E>>(
             .chain_ext(s_poly_positive.iter()),
     ).into_affine();
 
+    proof.sx_prime = multiexp(
+        srs.h_positive_x[0..(3 * n + 1)].iter(),
+        s_poly_negative
+            .iter()
+            .rev()
+            .chain_ext(Some(&E::Fr::zero()))
+            .chain_ext(s_poly_positive.iter()),
+    ).into_affine();
+
     // Evaluate r1(x, y) with a shift so we can demonstrate it
     // has no negative exponents
     proof.a1 = multiexp(
@@ -376,6 +395,7 @@ pub fn create_proof<E: Engine, C: Circuit<E>>(
     // Send S, Sx, A1, R1, Rx to the verifier
     transcript.commit_point(&proof.s);
     transcript.commit_point(&proof.sx);
+    transcript.commit_point(&proof.sx_prime);
     transcript.commit_point(&proof.a1);
     transcript.commit_point(&proof.r1);
     transcript.commit_point(&proof.r1_prime);
