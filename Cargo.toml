@@ -1,0 +1,6 @@
+[package]
+name = "sonic"
+version = "0.1.0"
+authors = ["Knuckles"]
+
+[dependencies]
