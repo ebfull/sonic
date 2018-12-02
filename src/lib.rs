@@ -1,5 +1,6 @@
 extern crate merlin;
 extern crate pairing;
+extern crate rand;
 
 pub mod protocol;
 pub mod srs;
@@ -19,16 +20,23 @@ pub trait Circuit<E: Engine> {
 }
 
 pub trait ConstraintSystem<E: Engine> {
+    /// Allocate a public input, given an assignment.
+    fn alloc_input<F>(&mut self, value: F) -> Result<Variable, SynthesisError>
+    where
+        F: FnOnce() -> Result<E::Fr, SynthesisError>;
+
     /// Allocates three new variables `(a, b, c)` given their assignment, enforcing that `a * b = c`.
     fn multiply<F>(&mut self, values: F) -> Result<(Variable, Variable, Variable), SynthesisError>
     where
         F: FnOnce() -> Result<(E::Fr, E::Fr, E::Fr), SynthesisError>;
 
-    /// Enforces that `left` = `right`.
-    fn enforce(&mut self, left: LinearCombination<E>, right: E::Fr);
+    /// Enforces that `lc` is zero.
+    fn enforce(&mut self, lc: LinearCombination<E>);
 
-    /// Get a wire value
-    fn get_value(&self, var: Variable) -> Result<E::Fr, SynthesisError>;
+    /// Just here for demo purposes.
+    fn get_value(&self, _var: Variable) -> Result<E::Fr, ()> {
+        Err(())
+    }
 }
 
 #[derive(Copy, Clone, Debug)]

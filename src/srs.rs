@@ -32,27 +32,32 @@ impl<E: Engine> SRS<E> {
     pub fn dummy(d: usize, _: E::Fr, _: E::Fr) -> Self {
         SRS {
             d: d,
-            g_negative_x: vec![E::G1Affine::one(); d+1],
-            g_positive_x: vec![E::G1Affine::one(); d+1],
+            g_negative_x: vec![E::G1Affine::one(); d + 1],
+            g_positive_x: vec![E::G1Affine::one(); d + 1],
 
-            h_negative_x: vec![E::G2Affine::one(); d+1],
-            h_positive_x: vec![E::G2Affine::one(); d+1],
+            h_negative_x: vec![E::G2Affine::one(); d + 1],
+            h_positive_x: vec![E::G2Affine::one(); d + 1],
 
             g_negative_x_alpha: vec![E::G1Affine::one(); d],
             g_positive_x_alpha: vec![E::G1Affine::one(); d],
 
-            h_negative_x_alpha: vec![E::G2Affine::one(); d+1],
-            h_positive_x_alpha: vec![E::G2Affine::one(); d+1],
+            h_negative_x_alpha: vec![E::G2Affine::one(); d + 1],
+            h_positive_x_alpha: vec![E::G2Affine::one(); d + 1],
         }
     }
 
     pub fn new(d: usize, x: E::Fr, alpha: E::Fr) -> Self {
         let mut g1 = Wnaf::new();
-        let mut g1 = g1.base(E::G1::one(), d*4);
+        let mut g1 = g1.base(E::G1::one(), d * 4);
         let mut g2 = Wnaf::new();
-        let mut g2 = g2.base(E::G2::one(), d*4);
-        
-        fn table<C: CurveAffine>(mut cur: C::Scalar, step: C::Scalar, num: usize, table: &mut Wnaf<usize, &[C::Projective], &mut Vec<i64>>) -> Vec<C> {
+        let mut g2 = g2.base(E::G2::one(), d * 4);
+
+        fn table<C: CurveAffine>(
+            mut cur: C::Scalar,
+            step: C::Scalar,
+            num: usize,
+            table: &mut Wnaf<usize, &[C::Projective], &mut Vec<i64>>,
+        ) -> Vec<C> {
             let mut v = vec![];
             for _ in 0..num {
                 v.push(table.scalar(cur.into_repr()));
