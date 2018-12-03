@@ -20,6 +20,8 @@ pub trait Circuit<E: Engine> {
 }
 
 pub trait ConstraintSystem<E: Engine> {
+    const ONE: Variable = Variable::A(0);
+
     /// Allocate a public input, given an assignment.
     fn alloc_input<F>(&mut self, value: F) -> Result<Variable, SynthesisError>
     where
@@ -31,7 +33,7 @@ pub trait ConstraintSystem<E: Engine> {
         F: FnOnce() -> Result<(E::Fr, E::Fr, E::Fr), SynthesisError>;
 
     /// Enforces that `lc` is zero.
-    fn enforce(&mut self, lc: LinearCombination<E>);
+    fn enforce_zero(&mut self, lc: LinearCombination<E>);
 
     /// Just here for demo purposes.
     fn get_value(&self, _var: Variable) -> Result<E::Fr, ()> {

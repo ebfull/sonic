@@ -133,7 +133,7 @@ impl<'a, E: Engine, C: Circuit<E>> Precomp<'a, E, C> {
                 Ok((Variable::A(index), Variable::B(index), Variable::C(index)))
             }
 
-            fn enforce(&mut self, _lc: LinearCombination<E>) {
+            fn enforce_zero(&mut self, _lc: LinearCombination<E>) {
                 self.q += 1;
                 // We don't care about linear constraints yet.
             }
@@ -459,7 +459,9 @@ impl<'a, E: Engine, C: Circuit<E> + 'a> Batch<'a, E, C> {
             assert_eq!(previous_s.len(), advice.s_prime.len());
             assert_eq!(previous_s.len(), advice.v.len());
 
-            for (((v, c_prime), s_prime), &(ref s, ref y)) in advice.v.iter()
+            for (((v, c_prime), s_prime), &(ref s, ref y)) in advice
+                .v
+                .iter()
                 .zip(advice.c_prime.iter())
                 .zip(advice.s_prime.iter())
                 .zip(previous_s.iter())
@@ -559,9 +561,7 @@ impl<'a, E: Engine, C: Circuit<E> + 'a> Batch<'a, E, C> {
         let c = {
             // C = [s(z, x) z^n] G
             let mut c = multiexp(&self.precomp.srs.g_positive_x[0..poly.len()], &poly[..]);
-            c.mul_assign(
-                z.pow(&[self.precomp.n as u64])
-            );
+            c.mul_assign(z.pow(&[self.precomp.n as u64]));
 
             c.into_affine()
         };
@@ -571,10 +571,7 @@ impl<'a, E: Engine, C: Circuit<E> + 'a> Batch<'a, E, C> {
 
         // opening = [\frac{s(z, x) z^n - s(z, w) z^n}{x - w}] G
         let opening = {
-            let poly = kate_divison(
-                poly.iter(),
-                w,
-            );
+            let poly = kate_divison(poly.iter(), w);
             let mut opening = multiexp(&self.precomp.srs.g_positive_x[0..poly.len()], &poly[..]);
             opening.mul_assign(z.pow(&[self.precomp.n as u64]).into_repr());
             opening.into_affine()
@@ -601,11 +598,9 @@ impl<'a, E: Engine, C: Circuit<E> + 'a> Batch<'a, E, C> {
             v.push(v_temp);
 
             c_prime.push({
-                let poly = kate_divison(
-                    poly.iter(),
-                    *y,
-                );
-                let mut opening = multiexp(&self.precomp.srs.g_positive_x[0..poly.len()], &poly[..]);
+                let poly = kate_divison(poly.iter(), *y);
+                let mut opening =
+                    multiexp(&self.precomp.srs.g_positive_x[0..poly.len()], &poly[..]);
                 opening.mul_assign(z.pow(&[self.precomp.n as u64]).into_repr());
                 opening.into_affine()
             });
@@ -635,7 +630,7 @@ impl<'a, E: Engine, C: Circuit<E> + 'a> Batch<'a, E, C> {
             opening,
             c_prime,
             s_prime,
-            v
+            v,
         }
     }
 
@@ -807,7 +802,7 @@ impl<E: Engine> ConstraintSystem<E> for SyEval<E> {
     {
         let (a, _, _) = self.multiply(|| unreachable!())?;
 
-        self.enforce(LinearCombination::from(a));
+        self.enforce_zero(LinearCombination::from(a));
 
         Ok(a)
     }
@@ -822,7 +817,7 @@ impl<E: Engine> ConstraintSystem<E> for SyEval<E> {
         Ok((Variable::A(index), Variable::B(index), Variable::C(index)))
     }
 
-    fn enforce(&mut self, lc: LinearCombination<E>) {
+    fn enforce_zero(&mut self, lc: LinearCombination<E>) {
         self.current_q += 1;
 
         for (var, mut coeff) in lc.0 {
@@ -957,7 +952,7 @@ impl<E: Engine> ConstraintSystem<E> for SxEval<E> {
     {
         let (a, _, _) = self.multiply(|| unreachable!())?;
 
-        self.enforce(LinearCombination::from(a));
+        self.enforce_zero(LinearCombination::from(a));
 
         Ok(a)
     }
@@ -972,7 +967,7 @@ impl<E: Engine> ConstraintSystem<E> for SxEval<E> {
         Ok((Variable::A(index), Variable::B(index), Variable::C(index)))
     }
 
-    fn enforce(&mut self, lc: LinearCombination<E>) {
+    fn enforce_zero(&mut self, lc: LinearCombination<E>) {
         self.yqn.mul_assign(&self.y);
 
         for (var, mut coeff) in lc.0 {
@@ -1032,7 +1027,7 @@ pub fn create_proof<E: Engine, C: Circuit<E>>(
             Ok((Variable::A(index), Variable::B(index), Variable::C(index)))
         }
 
-        fn enforce(&mut self, _lc: LinearCombination<E>) {
+        fn enforce_zero(&mut self, _lc: LinearCombination<E>) {
             // We don't care about linear combinations yet.
         }
 
@@ -1280,11 +1275,11 @@ fn my_fun_circuit_test() {
                 ))
             })?;
 
-            cs.enforce(LinearCombination::from(a) + a - b);
+            cs.enforce_zero(LinearCombination::from(a) + a - b);
 
             let multiplier = cs.alloc_input(|| Ok(E::Fr::from_str("20").unwrap()))?;
 
-            cs.enforce(LinearCombination::from(b) - multiplier);
+            cs.enforce_zero(LinearCombination::from(b) - multiplier);
 
             Ok(())
         }
