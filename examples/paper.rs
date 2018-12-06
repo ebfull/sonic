@@ -10,6 +10,8 @@ use sonic::srs::SRS;
 use sonic::{Circuit, ConstraintSystem, LinearCombination, SynthesisError, Variable};
 use std::marker::PhantomData;
 
+mod blake2b;
+
 struct Adaptor<'a, E: Engine, CS: ConstraintSystem<E> + 'a> {
     cs: &'a mut CS,
     _marker: PhantomData<E>,
@@ -121,9 +123,9 @@ impl<'a, E: Engine, CS: ConstraintSystem<E> + 'a> bellman::ConstraintSystem<E>
             .multiply(|| Ok((a_value.unwrap(), b_value.unwrap(), c_value.unwrap())))
             .unwrap();
 
-        self.cs.enforce(a_lc - a);
-        self.cs.enforce(b_lc - b);
-        self.cs.enforce(c_lc - c);
+        self.cs.enforce_zero(a_lc - a);
+        self.cs.enforce_zero(b_lc - b);
+        self.cs.enforce_zero(c_lc - c);
     }
 
     fn push_namespace<NR, N>(&mut self, _: N)

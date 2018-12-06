@@ -9,19 +9,20 @@ Note that this protocol differs from the paper in several ways,
 and is probably broken because of it. (I think it may be secure
 in the algebraic group model, which is all I really care about.)
 
- A' = [r_1(x, 1)] G
+Protocol
+--------
+
+A' = [r_1(x, 1)] G
 A_R = [r_1(x, 1) x^{d - N}] G
 A_L = [r_1(x, 1) x^{-d}] G
-  B = [r_2(x)] G
+B = [r_2(x)] G
 B_R = [r_2(x) x^{d}] G
 * e(A', [x^{d - N}] H) = e(A_R, H)
 * e(A', [x^{-d}] H) = e(A_L, H)
 * e(B, [x^{d}] H) = e(B_R, H)
------
 y <- F
-  A = [r_1(x, y)] G
-  S = [s(x, y)] G
------
+A = [r_1(x, y)] G
+S = [s(x, y)] G
 z <- F
 A_v = r_1(z, y)
 A_x = [\frac{r_1(x, 1) - A_v}{x - yz}] G
@@ -33,10 +34,25 @@ R = [r(x, y) \alpha] H
 T = [t(x, y) \alpha] G
 * e(A + B + 2S, R) e([-2k(y)] G, [\alpha] H) = e(T, H)
 
-Per-proof verification of S:
-S_v = s(z, y) z^n
- S' = [\frac{s(x, y) x^n - S_v}{x - z}] G
-* e(S', [x - z] H) = e(S, [x^n] H) e([-S_v] G, H)
+Per-proof verification of S
+---------------------------
+S' = [\frac{s(x, y) x^n - s(z, y) z^n}{x - z}] G
+* e(S', [x - z] H) = e(S, [x^n] H) e([-s(z, y) z^n] G, H) // Requires computing s(z, y) z^n
+
+Per-batch verification of each proof's (S, y)
+---------------------------------------------
+
+z <- F
+C = [s(z, x) z^n] G
+For each proof (S, y):
+    v = s(z, y) z^n
+    S' = [\frac{s(x, y) x^n - v}{x - z}] G
+    C' = [\frac{s(z, x) z^n - v}{x - y}] G
+    * e(S', [x - z] H) = e(S, [x^n] H) e([-v] G, H)
+    * e(C', [x - y] H) = e(C - [v] G, H)
+w <- F
+O = [\frac{s(z, x) z^n - s(z, w) z^n}{x - w}] G
+* e(O, [x - z] H) = e(C - [s(z, w) z^n] G, H) // Requires computing s(z, w) z^n
 */
 
 pub struct Proof<E: Engine> {
