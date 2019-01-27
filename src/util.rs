@@ -1,7 +1,7 @@
+use crate::SynthesisError;
 use merlin::Transcript;
 use pairing::{CurveAffine, CurveProjective, Engine, Field, PrimeField, PrimeFieldRepr};
 use std::io;
-use SynthesisError;
 
 pub trait TranscriptProtocol {
     fn commit_point<G: CurveAffine>(&mut self, point: &G);
@@ -206,6 +206,67 @@ where
     }
 
     q
+}
+
+#[test]
+fn laurent_division() {
+    use pairing::bls12_381::{Fr};
+    use pairing::PrimeField;
+
+    let mut poly = vec![
+        Fr::from_str("328947234").unwrap(),
+        Fr::from_str("3545623451111").unwrap(),
+        Fr::from_str("112").unwrap(),
+        Fr::from_str("55555").unwrap(),
+        Fr::from_str("1235685").unwrap(),
+    ];
+
+    fn eval(poly: &[Fr], point: Fr) -> Fr {
+        let point_inv = point.inverse().unwrap();
+
+        let mut acc = Fr::zero();
+        let mut tmp = Fr::one();
+        for p in &poly[2..] {
+            let mut t = *p;
+            t.mul_assign(&tmp);
+            acc.add_assign(&t);
+            tmp.mul_assign(&point);
+        }
+        let mut tmp = point_inv;
+        for p in poly[0..2].iter().rev() {
+            let mut t = *p;
+            t.mul_assign(&tmp);
+            acc.add_assign(&t);
+            tmp.mul_assign(&point_inv);
+        }
+
+        acc
+    }
+
+    let x = Fr::from_str("23").unwrap();
+    let z = Fr::from_str("2000").unwrap();
+
+    let p_at_x = eval(&poly, x);
+    let p_at_z = eval(&poly, z);
+
+    // poly = poly(X) - poly(z)
+    poly[2].sub_assign(&p_at_z);
+
+    let quotient_poly = kate_divison(&poly, z);
+
+    let quotient = eval(&quotient_poly, x);
+
+    // check that
+    // quotient * (x - z) = p_at_x - p_at_z
+
+    let mut lhs = x;
+    lhs.sub_assign(&z);
+    lhs.mul_assign(&quotient);
+
+    let mut rhs = p_at_x;
+    rhs.sub_assign(&p_at_z);
+
+    assert_eq!(lhs, rhs);
 }
 
 pub fn multiply_polynomials<E: Engine>(mut a: Vec<E::Fr>, mut b: Vec<E::Fr>) -> Vec<E::Fr> {

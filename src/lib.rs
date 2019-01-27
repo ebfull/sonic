@@ -1,12 +1,11 @@
-extern crate merlin;
-extern crate pairing;
+use pairing::{Engine, Field};
+use std::ops::{Add, Neg, Sub};
 
-pub mod protocol;
 pub mod srs;
 pub mod util;
-
-use pairing::{Engine, Field};
-use std::ops::{Add, Sub};
+pub mod batch;
+pub mod synthesis;
+pub mod protocol;
 
 #[derive(Copy, Clone, Debug)]
 pub enum SynthesisError {
@@ -19,16 +18,26 @@ pub trait Circuit<E: Engine> {
 }
 
 pub trait ConstraintSystem<E: Engine> {
-    /// Allocates three new variables `(a, b, c)` given their assignment, enforcing that `a * b = c`.
+    const ONE: Variable;
+
+    fn alloc<F>(&mut self, value: F) -> Result<Variable, SynthesisError>
+    where
+        F: FnOnce() -> Result<E::Fr, SynthesisError>;
+
+    fn alloc_input<F>(&mut self, value: F) -> Result<Variable, SynthesisError>
+    where
+        F: FnOnce() -> Result<E::Fr, SynthesisError>;
+
+    fn enforce_zero(&mut self, lc: LinearCombination<E>);
+
     fn multiply<F>(&mut self, values: F) -> Result<(Variable, Variable, Variable), SynthesisError>
     where
         F: FnOnce() -> Result<(E::Fr, E::Fr, E::Fr), SynthesisError>;
 
-    /// Enforces that `left` = `right`.
-    fn enforce(&mut self, left: LinearCombination<E>, right: E::Fr);
-
-    /// Get a wire value
-    fn get_value(&self, var: Variable) -> Result<E::Fr, SynthesisError>;
+    // TODO: get rid of this
+    fn get_value(&self, _var: Variable) -> Result<E::Fr, ()> {
+        Err(())
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -38,10 +47,58 @@ pub enum Variable {
     C(usize),
 }
 
+#[derive(Debug)]
+pub enum Coeff<E: Engine> {
+    Zero,
+    One,
+    NegativeOne,
+    Full(E::Fr),
+}
+
+impl<E: Engine> Coeff<E> {
+    pub fn multiply(&self, with: &mut E::Fr) {
+        match self {
+            Coeff::Zero => {
+                *with = E::Fr::zero();
+            },
+            Coeff::One => {},
+            Coeff::NegativeOne => {
+                with.negate();
+            },
+            Coeff::Full(val) => {
+                with.mul_assign(val);
+            }
+        }
+    }
+}
+
+impl<E: Engine> Copy for Coeff<E> {}
+impl<E: Engine> Clone for Coeff<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E: Engine> Neg for Coeff<E> {
+    type Output = Coeff<E>;
+
+    fn neg(self) -> Self {
+        match self {
+            Coeff::Zero => Coeff::Zero,
+            Coeff::One => Coeff::NegativeOne,
+            Coeff::NegativeOne => Coeff::One,
+            Coeff::Full(mut a) => {
+                a.negate();
+                Coeff::Full(a)
+            }
+        }
+    }
+}
+
 /// This represents a linear combination of some variables, with coefficients
 /// in the scalar field of a pairing-friendly elliptic curve group.
 #[derive(Clone)]
-pub struct LinearCombination<E: Engine>(Vec<(Variable, E::Fr)>);
+pub struct LinearCombination<E: Engine>(Vec<(Variable, Coeff<E>)>);
 
 impl<E: Engine> From<Variable> for LinearCombination<E> {
     fn from(var: Variable) -> LinearCombination<E> {
@@ -49,8 +106,8 @@ impl<E: Engine> From<Variable> for LinearCombination<E> {
     }
 }
 
-impl<E: Engine> AsRef<[(Variable, E::Fr)]> for LinearCombination<E> {
-    fn as_ref(&self) -> &[(Variable, E::Fr)] {
+impl<E: Engine> AsRef<[(Variable, Coeff<E>)]> for LinearCombination<E> {
+    fn as_ref(&self) -> &[(Variable, Coeff<E>)] {
         &self.0
     }
 }
@@ -61,23 +118,21 @@ impl<E: Engine> LinearCombination<E> {
     }
 }
 
-impl<E: Engine> Add<(E::Fr, Variable)> for LinearCombination<E> {
+impl<E: Engine> Add<(Coeff<E>, Variable)> for LinearCombination<E> {
     type Output = LinearCombination<E>;
 
-    fn add(mut self, (coeff, var): (E::Fr, Variable)) -> LinearCombination<E> {
+    fn add(mut self, (coeff, var): (Coeff<E>, Variable)) -> LinearCombination<E> {
         self.0.push((var, coeff));
 
         self
     }
 }
 
-impl<E: Engine> Sub<(E::Fr, Variable)> for LinearCombination<E> {
+impl<E: Engine> Sub<(Coeff<E>, Variable)> for LinearCombination<E> {
     type Output = LinearCombination<E>;
 
-    fn sub(self, (mut coeff, var): (E::Fr, Variable)) -> LinearCombination<E> {
-        coeff.negate();
-
-        self + (coeff, var)
+    fn sub(self, (coeff, var): (Coeff<E>, Variable)) -> LinearCombination<E> {
+        self + (-coeff, var)
     }
 }
 
@@ -85,7 +140,7 @@ impl<E: Engine> Add<Variable> for LinearCombination<E> {
     type Output = LinearCombination<E>;
 
     fn add(self, other: Variable) -> LinearCombination<E> {
-        self + (E::Fr::one(), other)
+        self + (Coeff::One, other)
     }
 }
 
@@ -93,7 +148,7 @@ impl<E: Engine> Sub<Variable> for LinearCombination<E> {
     type Output = LinearCombination<E>;
 
     fn sub(self, other: Variable) -> LinearCombination<E> {
-        self - (E::Fr::one(), other)
+        self - (Coeff::One, other)
     }
 }
 
@@ -115,34 +170,6 @@ impl<'a, E: Engine> Sub<&'a LinearCombination<E>> for LinearCombination<E> {
     fn sub(mut self, other: &'a LinearCombination<E>) -> LinearCombination<E> {
         for s in &other.0 {
             self = self - (s.1, s.0);
-        }
-
-        self
-    }
-}
-
-impl<'a, E: Engine> Add<(E::Fr, &'a LinearCombination<E>)> for LinearCombination<E> {
-    type Output = LinearCombination<E>;
-
-    fn add(mut self, (coeff, other): (E::Fr, &'a LinearCombination<E>)) -> LinearCombination<E> {
-        for s in &other.0 {
-            let mut tmp = s.1;
-            tmp.mul_assign(&coeff);
-            self = self + (tmp, s.0);
-        }
-
-        self
-    }
-}
-
-impl<'a, E: Engine> Sub<(E::Fr, &'a LinearCombination<E>)> for LinearCombination<E> {
-    type Output = LinearCombination<E>;
-
-    fn sub(mut self, (coeff, other): (E::Fr, &'a LinearCombination<E>)) -> LinearCombination<E> {
-        for s in &other.0 {
-            let mut tmp = s.1;
-            tmp.mul_assign(&coeff);
-            self = self - (tmp, s.0);
         }
 
         self

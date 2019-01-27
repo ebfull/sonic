@@ -1,316 +1,624 @@
-use merlin::Transcript;
-use pairing::{CurveAffine, CurveProjective, Engine, Field};
-use srs::SRS;
-use util::{kate_divison, multiexp, multiply_polynomials, ChainExt, TranscriptProtocol};
-use {Circuit, ConstraintSystem, LinearCombination, SynthesisError, Variable};
+use pairing::{Engine, Field, CurveProjective};
+use std::marker::PhantomData;
+use merlin::{Transcript};
+use crate::util::*;
+use crate::batch::Batch;
+use crate::synthesis::{Backend, SynthesisDriver};
+use crate::{Circuit, SynthesisError, Variable, Coeff};
+use crate::srs::SRS;
 
-pub struct Proof<E: Engine> {
-    com_r: E::G1Affine,
-    com_r_prime: E::G2Affine,
-    r2: E::G1Affine,
-    a2: E::G1Affine,
-    r1: E::G1Affine,
-    r1_prime: E::G2Affine,
+#[derive(Clone)]
+pub struct SxyAdvice<E: Engine> {
     s: E::G1Affine,
-    sx: E::G1Affine,
-    sx_prime: E::G2Affine,
-    a1: E::G1Affine,
-    comr_quotient: E::G1Affine,
-    r1_quotient: E::G1Affine,
-    av: E::Fr,
-    sv: E::Fr,
-    s_quotient: E::G1Affine,
-    r_prime: E::G2Affine,
-    rx: E::G1Affine,
+    opening: E::G1Affine,
+    szy: E::Fr,
+}
+
+#[derive(Clone)]
+pub struct Proof<E: Engine> {
+    r: E::G1Affine,
     t: E::G1Affine,
+    rz: E::Fr,
+    rzy: E::Fr,
+    z_opening: E::G1Affine,
+    zy_opening: E::G1Affine
 }
 
-pub struct Precomp {
+pub struct MultiVerifier<E: Engine, C: Circuit<E>, S: SynthesisDriver> {
+    circuit: C,
+    batch: Batch<E>,
+    k_map: Vec<usize>,
     n: usize,
+    q: usize,
+    _marker: PhantomData<(E, S)>
 }
 
-impl Precomp {
-    pub fn new<E: Engine, C: Circuit<E>>(circuit: &C) -> Result<Self, SynthesisError> {
-        struct Temp {
+impl<E: Engine, C: Circuit<E>, S: SynthesisDriver> MultiVerifier<E, C, S> {
+    pub fn new(circuit: C, srs: &SRS<E>) -> Result<Self, SynthesisError> {
+        struct Preprocess<E: Engine> {
+            k_map: Vec<usize>,
             n: usize,
+            q: usize,
+            _marker: PhantomData<E>
         }
 
-        impl<E: Engine> ConstraintSystem<E> for Temp {
-            fn multiply<F>(
-                &mut self,
-                _: F,
-            ) -> Result<(Variable, Variable, Variable), SynthesisError>
-            where
-                F: FnOnce() -> Result<(E::Fr, E::Fr, E::Fr), SynthesisError>,
-            {
+        impl<'a, E: Engine> Backend<E> for &'a mut Preprocess<E> {
+            fn new_k_power(&mut self, index: usize) {
+                self.k_map.push(index);
+            }
+
+            fn new_multiplication_gate(&mut self) {
                 self.n += 1;
-
-                Ok((
-                    Variable::A(self.n),
-                    Variable::B(self.n),
-                    Variable::C(self.n),
-                ))
             }
 
-            fn enforce(&mut self, _: LinearCombination<E>, _: E::Fr) {
-                // We don't care about linear constraints yet, we're just
-                // constructing the witness.
-            }
-
-            fn get_value(&self, _: Variable) -> Result<E::Fr, SynthesisError> {
-                Err(SynthesisError::AssignmentMissing)
+            fn new_linear_constraint(&mut self) {
+                self.q += 1;
             }
         }
 
-        let mut tmp = Temp { n: 0 };
+        let mut preprocess = Preprocess { k_map: vec![], n: 0, q: 0, _marker: PhantomData };
 
-        circuit.synthesize(&mut tmp)?;
+        S::synthesize(&mut preprocess, &circuit)?;
 
-        Ok(Precomp { n: tmp.n })
-    }
-}
-
-pub fn verify_proof<E: Engine, C: Circuit<E>>(
-    circuit: &C,
-    srs: &SRS<E>,
-    proof: &Proof<E>,
-    precomp: &Precomp,
-    check_s_x: bool
-) -> Result<(), SynthesisError> {
-    let mut transcript = Transcript::new(&[]);
-
-    transcript.commit_point(&proof.com_r);
-    transcript.commit_point(&proof.com_r_prime);
-    transcript.commit_point(&proof.r2);
-    transcript.commit_point(&proof.a2);
-
-    let y = transcript.get_challenge_scalar::<E::Fr>();
-
-    transcript.commit_point(&proof.s);
-    transcript.commit_point(&proof.sx);
-    transcript.commit_point(&proof.sx_prime);
-    transcript.commit_point(&proof.a1);
-    transcript.commit_point(&proof.r1);
-    transcript.commit_point(&proof.r1_prime);
-    transcript.commit_point(&proof.rx);
-
-    let z = transcript.get_challenge_scalar::<E::Fr>();
-
-    if proof.r1.pairing_with(&E::G2Affine::one())
-        != E::G1Affine::one().pairing_with(&proof.r1_prime)
-    {
-        return Err(SynthesisError::Violation);
+        Ok(MultiVerifier {
+            circuit,
+            batch: Batch::new(srs, preprocess.n),
+            k_map: preprocess.k_map,
+            n: preprocess.n,
+            q: preprocess.q,
+            _marker: PhantomData
+        })
     }
 
-    if proof.com_r.pairing_with(&E::G2Affine::one())
-        != E::G1Affine::one().pairing_with(&proof.com_r_prime)
+    pub fn add_aggregate(
+        &mut self,
+        proofs: &[(Proof<E>, SxyAdvice<E>)],
+        aggregate: &Aggregate<E>,
+    )
     {
-        return Err(SynthesisError::Violation);
-    }
+        let mut transcript = Transcript::new(&[]);
+        let mut y_values: Vec<E::Fr> = Vec::with_capacity(proofs.len());
+        for &(ref proof, ref sxyadvice) in proofs {
+            {
+                let mut transcript = Transcript::new(&[]);
+                transcript.commit_point(&proof.r);
+                y_values.push(transcript.get_challenge_scalar());
+            }
 
-    // kate check on r1
-    {
-        let mut lhs = proof.com_r.pairing_with(&E::G2Affine::one());
-        let mut av = E::G1Affine::one().mul(proof.av).into_affine();
-        av.negate();
-        lhs.mul_assign(&av.pairing_with(&srs.h_positive_x_alpha[0]));
-        let mut zy = z;
-        zy.mul_assign(&y);
-        let mut tmp = srs.h_positive_x_alpha[0].mul(zy);
-        tmp.negate();
-        tmp.add_assign_mixed(&srs.h_positive_x_alpha[1]);
-        let rhs = proof.comr_quotient.pairing_with(&tmp.into_affine());
-
-        if lhs != rhs {
-            return Err(SynthesisError::Violation);
+            transcript.commit_point(&sxyadvice.s);
         }
-    }
-    {
-        let mut lhs = proof.r1.pairing_with(&E::G2Affine::one());
-        let mut av = E::G1Affine::one().mul(proof.av).into_affine();
-        av.negate();
-        lhs.mul_assign(&av.pairing_with(&srs.h_positive_x_alpha[0]));
-        let mut tmp = srs.h_positive_x_alpha[0].mul(z);
-        tmp.negate();
-        tmp.add_assign_mixed(&srs.h_positive_x_alpha[1]);
-        let rhs = proof.r1_quotient.pairing_with(&tmp.into_affine());
 
-        if lhs != rhs {
-            return Err(SynthesisError::Violation);
-        }
-    }
+        let z: E::Fr = transcript.get_challenge_scalar();
 
-    if proof.a1.pairing_with(&srs.h_positive_x_alpha[srs.d])
-        != proof.r1.pairing_with(&E::G2Affine::one())
-    {
-        return Err(SynthesisError::Violation);
-    }
+        transcript.commit_point(&aggregate.c);
 
-    if proof.a2.pairing_with(&srs.h_negative_x_alpha[srs.d])
-        != proof.r2.pairing_with(&E::G2Affine::one())
-    {
-        return Err(SynthesisError::Violation);
-    }
+        let w: E::Fr = transcript.get_challenge_scalar();
 
-    let mut r = proof.r1.into_projective();
-    r.add_assign_mixed(&proof.r2);
-    let r = r.into_affine();
+        let szw = {
+            let mut tmp = SxEval::new(w, self.n);
+            S::synthesize(&mut tmp, &self.circuit).unwrap(); // TODO
 
-    {
-        let mut correct = proof.s.into_projective();
-        correct.double();
-        correct.add_assign_mixed(&r);
-        let correct = correct.into_affine();
-        if E::G1Affine::one().pairing_with(&proof.r_prime)
-            != correct.pairing_with(&E::G2Affine::one())
+            tmp.finalize(z)
+        };
+
         {
-            return Err(SynthesisError::Violation);
+            // TODO: like everything else doing this, this isn't really random
+            let random: E::Fr;
+            let mut transcript = transcript.clone();
+            random = transcript.get_challenge_scalar();
+
+            self.batch.add_opening(aggregate.opening, random, w);
+            self.batch.add_commitment(aggregate.c, random);
+            self.batch.add_opening_value(szw, random);
         }
-    }
 
-    if proof.rx.pairing_with(&E::G2Affine::one())
-        != proof.r1.pairing_with(&srs.h_positive_x[srs.d - precomp.n])
-    {
-        return Err(SynthesisError::Violation);
-    }
+        for ((opening, value), &y) in aggregate.c_openings.iter().zip(y_values.iter()) {
+            let random: E::Fr;
+            let mut transcript = transcript.clone();
+            random = transcript.get_challenge_scalar();
 
-    if proof.s.pairing_with(&srs.h_positive_x[precomp.n])
-        != proof.sx.pairing_with(&srs.h_positive_x_alpha[0])
-    {
-        return Err(SynthesisError::Violation);
-    }
+            self.batch.add_opening(*opening, random, y);
+            self.batch.add_commitment(aggregate.c, random);
+            self.batch.add_opening_value(*value, random);
+        }
 
-    if proof.sx.pairing_with(&E::G2Affine::one())
-        != proof.sx_prime.pairing_with(&E::G1Affine::one())
-    {
-        return Err(SynthesisError::Violation);
-    }
+        let random: E::Fr;
+        {
+            let mut transcript = transcript.clone();
+            random = transcript.get_challenge_scalar();
+        }
 
-    // Compute s(X, y)
-    let mut k_y = {
-        if check_s_x {
-            let (s_poly_negative, s_poly_positive, k_y) = {
-                let mut s_eval = SEval::new(y, precomp.n);
-                circuit.synthesize(&mut s_eval)?;
-                s_eval.finalize()
-            };
+        let mut expected_value = E::Fr::zero();
+        for ((_, advice), c_opening) in proofs.iter().zip(aggregate.c_openings.iter()) {
+            let mut r: E::Fr = transcript.get_challenge_scalar();
 
-            let mut expected_sv = E::Fr::zero();
-            let mut tmp = E::Fr::one();
-            for s in s_poly_negative.iter().rev().chain(Some(&E::Fr::zero())).chain(s_poly_positive.iter()) {
-                let mut s = *s;
-                s.mul_assign(&tmp);
-                expected_sv.add_assign(&s);
-                tmp.mul_assign(&z);
+            // expected value of the later opening
+            {
+                let mut tmp = c_opening.1;
+                tmp.mul_assign(&r);
+                expected_value.add_assign(&tmp);
             }
 
-            if proof.sv != expected_sv {
-                return Err(SynthesisError::Violation);
-            }
+            r.mul_assign(&random);
 
-            k_y
-        } else {
-            let mut s_eval = KYEval::new(y, precomp.n);
-            circuit.synthesize(&mut s_eval)?;
-            s_eval.finalize()
+            self.batch.add_commitment(advice.s, r);
         }
-    };
 
-    // the important check
+        self.batch.add_opening_value(expected_value, random);
+        self.batch.add_opening(aggregate.s_opening, random, z);
+    }
+
+    pub fn add_proof_with_advice(
+        &mut self,
+        proof: &Proof<E>,
+        inputs: &[E::Fr],
+        advice: &SxyAdvice<E>,
+    )
     {
-        k_y.double();
-        k_y.negate();
-        let lhs = proof.t.pairing_with(&srs.h_positive_x_alpha[0]);
-        let rhs = srs.g_positive_x_alpha[0].mul(k_y).into_affine();
-        let mut rhs = rhs.pairing_with(&srs.h_negative_x_alpha[1]);
-        rhs.mul_assign(&r.pairing_with(&proof.r_prime));
+        let mut z = None;
 
-        if lhs != rhs {
-            return Err(SynthesisError::Violation);
+        self.add_proof(proof, inputs, |_z, _y| {
+            z = Some(_z);
+            Some(advice.szy)
+        });
+
+        let z = z.unwrap();
+
+        // We need to open up SxyAdvice.s at z using SxyAdvice.opening
+        let mut transcript = Transcript::new(&[]);
+        transcript.commit_point(&advice.opening);
+        transcript.commit_point(&advice.s);
+        transcript.commit_scalar(&advice.szy);
+        let random: E::Fr = transcript.get_challenge_scalar();
+
+        self.batch.add_opening(advice.opening, random, z);
+        self.batch.add_commitment(advice.s, random);
+        self.batch.add_opening_value(advice.szy, random);
+    }
+
+    pub fn add_proof<F>(
+        &mut self,
+        proof: &Proof<E>,
+        inputs: &[E::Fr],
+        sxy: F
+    )
+        where F: FnOnce(E::Fr, E::Fr) -> Option<E::Fr>
+    {
+        let mut transcript = Transcript::new(&[]);
+
+        transcript.commit_point(&proof.r);
+
+        let y: E::Fr = transcript.get_challenge_scalar();
+
+        transcript.commit_point(&proof.t);
+
+        let z: E::Fr = transcript.get_challenge_scalar();
+
+        transcript.commit_scalar(&proof.rz);
+        transcript.commit_scalar(&proof.rzy);
+
+        let r1: E::Fr = transcript.get_challenge_scalar();
+
+        transcript.commit_point(&proof.z_opening);
+        transcript.commit_point(&proof.zy_opening);
+
+        // First, the easy one. Let's open up proof.r at zy, using proof.zy_opening
+        // as the evidence and proof.rzy as the opening.
+        {
+            let random = transcript.get_challenge_scalar();
+            let mut zy = z;
+            zy.mul_assign(&y);
+            self.batch.add_opening(proof.zy_opening, random, zy);
+            self.batch.add_commitment_max_n(proof.r, random);
+            self.batch.add_opening_value(proof.rzy, random);
+        }
+
+        // Now we need to compute t(z, y) with what we have. Let's compute k(y).
+        let mut ky = E::Fr::zero();
+        for (exp, input) in self.k_map.iter().zip(Some(E::Fr::one()).iter().chain(inputs.iter())) {
+            let mut term = y.pow(&[(*exp + self.n) as u64]);
+            term.mul_assign(input);
+            ky.add_assign(&term);
+        }
+
+        // Compute s(z, y)
+        let szy = sxy(z, y).unwrap_or_else(|| {
+            let mut tmp = SxEval::new(y, self.n);
+            S::synthesize(&mut tmp, &self.circuit).unwrap(); // TODO
+
+            tmp.finalize(z)
+
+            // let mut tmp = SyEval::new(z, self.n, self.q);
+            // S::synthesize(&mut tmp, &self.circuit).unwrap(); // TODO
+
+            // tmp.finalize(y)
+        });
+
+        // Finally, compute t(z, y)
+        let mut tzy = proof.rzy;
+        tzy.add_assign(&szy);
+        tzy.mul_assign(&proof.rz);
+        tzy.sub_assign(&ky);
+
+        // We open these both at the same time by keeping their commitments
+        // linearly independent (using r1).
+        {
+            let mut random = transcript.get_challenge_scalar();
+
+            self.batch.add_opening(proof.z_opening, random, z);
+            self.batch.add_opening_value(tzy, random);
+            self.batch.add_commitment(proof.t, random);
+
+            random.mul_assign(&r1);
+
+            self.batch.add_opening_value(proof.rz, random);
+            self.batch.add_commitment_max_n(proof.r, random);
         }
     }
 
-    // Kate check on s(x, y)
-    {
-        let mut lhs = proof.sx.pairing_with(&E::G2Affine::one());
-        let mut sv = E::G1Affine::one().mul(proof.sv).into_affine();
-        sv.negate();
-        lhs.mul_assign(&sv.pairing_with(&srs.h_positive_x[0]));
-        let mut tmp = srs.h_positive_x[0].mul(z);
-        tmp.negate();
-        tmp.add_assign_mixed(&srs.h_positive_x[1]);
-        let rhs = proof.s_quotient.pairing_with(&tmp.into_affine());
-
-        if lhs != rhs {
-            return Err(SynthesisError::Violation);
-        }
+    pub fn check_all(self) -> bool {
+        self.batch.check_all()
     }
-
-    Ok(())
 }
 
-pub fn create_proof<E: Engine, C: Circuit<E>>(
+#[derive(Clone)]
+pub struct Aggregate<E: Engine> {
+    // Commitment to s(z, Y)
+    c: E::G1Affine,
+    // We have to open each of the S commitments to a random point `z`
+    s_opening: E::G1Affine,
+    // We have to open C to each constituent `y`
+    c_openings: Vec<(E::G1Affine, E::Fr)>,
+    // Then we have to finally open C
+    opening: E::G1Affine,
+}
+
+pub fn create_aggregate<E: Engine, C: Circuit<E>, S: SynthesisDriver>(
     circuit: &C,
+    inputs: &[(Proof<E>, SxyAdvice<E>)],
     srs: &SRS<E>,
-) -> Result<Proof<E>, SynthesisError> {
-    let mut proof = Proof {
-        com_r: E::G1Affine::zero(),
-        com_r_prime: E::G2Affine::zero(),
-        r2: E::G1Affine::zero(),
-        a2: E::G1Affine::zero(),
-        r1: E::G1Affine::zero(),
-        r1_prime: E::G2Affine::zero(),
-        s: E::G1Affine::zero(),
-        sx: E::G1Affine::zero(),
-        sx_prime: E::G2Affine::zero(),
-        a1: E::G1Affine::zero(),
-        comr_quotient: E::G1Affine::zero(),
-        r1_quotient: E::G1Affine::zero(),
-        av: E::Fr::zero(),
-        sv: E::Fr::zero(),
-        s_quotient: E::G1Affine::zero(),
-        r_prime: E::G2Affine::zero(),
-        rx: E::G1Affine::zero(),
-        t: E::G1Affine::zero(),
+) -> Aggregate<E>
+{
+    // TODO: precompute this?
+    let (n, q) = {
+        struct CountN {
+            n: usize,
+            q: usize
+        }
+
+        impl<'a, E: Engine> Backend<E> for &'a mut CountN {
+            fn new_multiplication_gate(&mut self) {
+                self.n += 1;
+            }
+
+            fn new_linear_constraint(&mut self) {
+                self.q += 1;
+            }
+        }
+
+        let mut tmp = CountN{n:0,q:0};
+        S::synthesize(&mut tmp, circuit).unwrap(); // TODO
+
+        (tmp.n, tmp.q)
     };
 
-    // Compute our wire values
+    let mut transcript = Transcript::new(&[]);
+    let mut y_values: Vec<E::Fr> = Vec::with_capacity(inputs.len());
+    for &(ref proof, ref sxyadvice) in inputs {
+        {
+            let mut transcript = Transcript::new(&[]);
+            transcript.commit_point(&proof.r);
+            y_values.push(transcript.get_challenge_scalar());
+        }
+
+        transcript.commit_point(&sxyadvice.s);
+    }
+
+    let z: E::Fr = transcript.get_challenge_scalar();
+
+    // Compute s(z, Y)
+    let (s_poly_negative, s_poly_positive) = {
+        let mut tmp = SyEval::new(z, n, q);
+        S::synthesize(&mut tmp, circuit).unwrap(); // TODO
+
+        tmp.poly()
+    };
+
+    // Compute C = g^{s(z, x)}
+    let c = multiexp(
+        srs.g_positive_x_alpha[0..(n + q)]
+            .iter()
+            .chain_ext(srs.g_negative_x_alpha[0..n].iter()),
+        s_poly_positive.iter().chain_ext(s_poly_negative.iter())
+    ).into_affine();
+
+    transcript.commit_point(&c);
+
+    // Open C at w
+    let w: E::Fr = transcript.get_challenge_scalar();
+
+    let value = compute_value::<E>(&w, &s_poly_positive, &s_poly_negative);
+
+    let opening = {
+        let mut value = value;
+        value.negate();
+
+        let poly = kate_divison(
+            s_poly_negative.iter().rev().chain_ext(Some(value).iter()).chain_ext(s_poly_positive.iter()),
+            w,
+        );
+
+        let negative_poly = poly[0..n].iter().rev();
+        let positive_poly = poly[n..].iter();
+        multiexp(
+            srs.g_negative_x[1..(negative_poly.len() + 1)].iter().chain_ext(
+                srs.g_positive_x[0..positive_poly.len()].iter()
+            ),
+            negative_poly.chain_ext(positive_poly)
+        ).into_affine()
+    };
+
+    // Let's open up C to every y.
+    fn compute_value<E: Engine>(y: &E::Fr, poly_positive: &[E::Fr], poly_negative: &[E::Fr]) -> E::Fr {
+        let mut value = E::Fr::zero();
+
+        let yinv = y.inverse().unwrap(); // TODO
+        let mut tmp = yinv;
+        for &coeff in poly_negative {
+            let mut coeff = coeff;
+            coeff.mul_assign(&tmp);
+            value.add_assign(&coeff);
+            tmp.mul_assign(&yinv);
+        }
+
+        let mut tmp = *y;
+        for &coeff in poly_positive {
+            let mut coeff = coeff;
+            coeff.mul_assign(&tmp);
+            value.add_assign(&coeff);
+            tmp.mul_assign(&y);
+        }
+
+        value
+    }
+
+    let mut c_openings = vec![];
+    for y in &y_values {
+        let value = compute_value::<E>(y, &s_poly_positive, &s_poly_negative);
+
+        let opening = {
+            let mut value = value;
+            value.negate();
+
+            let poly = kate_divison(
+                s_poly_negative.iter().rev().chain_ext(Some(value).iter()).chain_ext(s_poly_positive.iter()),
+                *y,
+            );
+
+            let negative_poly = poly[0..n].iter().rev();
+            let positive_poly = poly[n..].iter();
+            multiexp(
+                srs.g_negative_x[1..(negative_poly.len() + 1)].iter().chain_ext(
+                    srs.g_positive_x[0..positive_poly.len()].iter()
+                ),
+                negative_poly.chain_ext(positive_poly)
+            ).into_affine()
+        };
+
+        c_openings.push((opening, value));
+    }
+
+    // Okay, great. Now we need to open up each S at the same point z to the same value.
+    // Since we're opening up all the S's at the same point, we create a bunch of random
+    // challenges instead and open up a random linear combination.
+
+    let mut poly_negative = vec![E::Fr::zero(); n];
+    let mut poly_positive = vec![E::Fr::zero(); 2*n];
+    let mut expected_value = E::Fr::zero();
+
+    for (y, c_opening) in y_values.iter().zip(c_openings.iter()) {
+        // Compute s(X, y_i)
+        let (s_poly_negative, s_poly_positive) = {
+            let mut tmp = SxEval::new(*y, n);
+            S::synthesize(&mut tmp, circuit).unwrap(); // TODO
+
+            tmp.poly()
+        };
+
+        let mut value = c_opening.1;
+        let r: E::Fr = transcript.get_challenge_scalar();
+        value.mul_assign(&r);
+        expected_value.add_assign(&value);
+
+        for (mut coeff, target) in s_poly_negative.into_iter().zip(poly_negative.iter_mut()) {
+            coeff.mul_assign(&r);
+            target.add_assign(&coeff);
+        }
+
+        for (mut coeff, target) in s_poly_positive.into_iter().zip(poly_positive.iter_mut()) {
+            coeff.mul_assign(&r);
+            target.add_assign(&coeff);
+        }
+    }
+
+    let s_opening = {
+        let mut value = expected_value;
+        value.negate();
+
+        let poly = kate_divison(
+            poly_negative.iter().rev().chain_ext(Some(value).iter()).chain_ext(poly_positive.iter()),
+            z,
+        );
+
+        let negative_poly = poly[0..n].iter().rev();
+        let positive_poly = poly[n..].iter();
+        multiexp(
+            srs.g_negative_x[1..(negative_poly.len() + 1)].iter().chain_ext(
+                srs.g_positive_x[0..positive_poly.len()].iter()
+            ),
+            negative_poly.chain_ext(positive_poly)
+        ).into_affine()
+    };
+
+    Aggregate {
+        // Commitment to s(z, Y)
+        c,
+        // We have to open each of the S commitments to a random point `z`
+        s_opening,
+        // We have to open C to each constituent `y`
+        c_openings,
+        // Then we have to finally open C
+        opening,
+    }
+}
+
+pub fn create_advice<E: Engine, C: Circuit<E>, S: SynthesisDriver>(
+    circuit: &C,
+    proof: &Proof<E>,
+    srs: &SRS<E>
+) -> SxyAdvice<E>
+{
+    // annoying, but we need n to compute s(z, y), and this isn't
+    // precomputed anywhere yet
+    let n = {
+        struct CountN {
+            n: usize
+        }
+
+        impl<'a, E: Engine> Backend<E> for &'a mut CountN {
+            fn new_multiplication_gate(&mut self) {
+                self.n += 1;
+            }
+        }
+
+        let mut tmp = CountN{n:0};
+        S::synthesize(&mut tmp, circuit).unwrap(); // TODO
+
+        tmp.n
+    };
+
+    let z: E::Fr;
+    let y: E::Fr;
+    {
+        let mut transcript = Transcript::new(&[]);
+        transcript.commit_point(&proof.r);
+        y = transcript.get_challenge_scalar();
+        transcript.commit_point(&proof.t);
+        z = transcript.get_challenge_scalar();
+    }
+    let z_inv = z.inverse().unwrap(); // TODO
+
+    let (s_poly_negative, s_poly_positive) = {
+        let mut tmp = SxEval::new(y, n);
+        S::synthesize(&mut tmp, circuit).unwrap(); // TODO
+
+        tmp.poly()
+    };
+
+    // Compute S commitment
+    let s = multiexp(
+        srs.g_positive_x_alpha[0..(2 * n)]
+            .iter()
+            .chain_ext(srs.g_negative_x_alpha[0..(n)].iter()),
+        s_poly_positive.iter().chain_ext(s_poly_negative.iter())
+    ).into_affine();
+
+    // Compute s(z, y)
+    let mut szy = E::Fr::zero();
+    {
+        let mut tmp = z;
+        for &p in &s_poly_positive {
+            let mut p = p;
+            p.mul_assign(&tmp);
+            szy.add_assign(&p);
+            tmp.mul_assign(&z);
+        }
+        let mut tmp = z_inv;
+        for &p in &s_poly_negative {
+            let mut p = p;
+            p.mul_assign(&tmp);
+            szy.add_assign(&p);
+            tmp.mul_assign(&z_inv);
+        }
+    }
+
+    // Compute kate opening
+    let opening = {
+        let mut open = szy;
+        open.negate();
+
+        let poly = kate_divison(
+            s_poly_negative.iter().rev().chain_ext(Some(open).iter()).chain_ext(s_poly_positive.iter()),
+            z,
+        );
+
+        let negative_poly = poly[0..n].iter().rev();
+        let positive_poly = poly[n..].iter();
+        multiexp(
+            srs.g_negative_x[1..(negative_poly.len() + 1)].iter().chain_ext(
+                srs.g_positive_x[0..positive_poly.len()].iter()
+            ),
+            negative_poly.chain_ext(positive_poly)
+        ).into_affine()
+    };
+
+    SxyAdvice {
+        s,
+        szy,
+        opening
+    }
+}
+
+pub fn create_proof<E: Engine, C: Circuit<E>, S: SynthesisDriver>(
+    circuit: &C,
+    srs: &SRS<E>
+) -> Result<Proof<E>, SynthesisError>
+{
     struct Wires<E: Engine> {
         a: Vec<E::Fr>,
         b: Vec<E::Fr>,
-        c: Vec<E::Fr>,
+        c: Vec<E::Fr>
     }
 
-    impl<E: Engine> ConstraintSystem<E> for Wires<E> {
-        fn multiply<F>(
-            &mut self,
-            values: F,
-        ) -> Result<(Variable, Variable, Variable), SynthesisError>
-        where
-            F: FnOnce() -> Result<(E::Fr, E::Fr, E::Fr), SynthesisError>,
+    impl<'a, E: Engine> Backend<E> for &'a mut Wires<E> {
+        fn new_multiplication_gate(&mut self) {
+            self.a.push(E::Fr::zero());
+            self.b.push(E::Fr::zero());
+            self.c.push(E::Fr::zero());
+        }
+
+        fn get_var(&self, variable: Variable) -> Option<E::Fr> {
+            Some(match variable {
+                Variable::A(index) => {
+                    self.a[index - 1]
+                },
+                Variable::B(index) => {
+                    self.b[index - 1]
+                },
+                Variable::C(index) => {
+                    self.c[index - 1]
+                }
+            })
+        }
+
+        fn set_var<F>(&mut self, variable: Variable, value: F) -> Result<(), SynthesisError>
+            where F: FnOnce() -> Result<E::Fr, SynthesisError>
         {
-            let index = self.a.len();
-            let (a, b, c) = values()?;
+            let value = value()?;
 
-            self.a.push(a);
-            self.b.push(b);
-            self.c.push(c);
+            match variable {
+                Variable::A(index) => {
+                    self.a[index - 1] = value;
+                },
+                Variable::B(index) => {
+                    self.b[index - 1] = value;
+                },
+                Variable::C(index) => {
+                    self.c[index - 1] = value;
+                }
+            }
 
-            Ok((Variable::A(index), Variable::B(index), Variable::C(index)))
-        }
-
-        fn enforce(&mut self, _: LinearCombination<E>, _: E::Fr) {
-            // We don't care about linear constraints yet, we're just
-            // constructing the witness.
-        }
-
-        fn get_value(&self, var: Variable) -> Result<E::Fr, SynthesisError> {
-            match var {
-                Variable::A(index) => self.a.get(index),
-                Variable::B(index) => self.b.get(index),
-                Variable::C(index) => self.c.get(index),
-            }.ok_or(SynthesisError::AssignmentMissing)
-                .map(|x| *x)
+            Ok(())
         }
     }
 
@@ -320,452 +628,478 @@ pub fn create_proof<E: Engine, C: Circuit<E>>(
         c: vec![],
     };
 
-    circuit.synthesize(&mut wires)?;
+    S::synthesize(&mut wires, circuit)?;
 
-    // TODO: we can't have more wires than the SRS supports
     let n = wires.a.len();
 
-    println!("gates: {}", n);
-
-    // Construct the transcript with the verifier
     let mut transcript = Transcript::new(&[]);
 
-    // We're going to start by commiting to r1(X) in both groups, in alpha
-    proof.com_r = multiexp(&srs.g_positive_x_alpha[0..n], &wires.a).into_affine();
-    proof.com_r_prime = multiexp(&srs.h_positive_x_alpha[1..(n + 1)], &wires.a).into_affine();
-
-    // We're going to evaluate r2(X) in alpha
-    proof.r2 = multiexp(
-        srs.g_negative_x_alpha[0..(2 * n)].iter(),
-        wires.b.iter().chain_ext(wires.c.iter()),
+    let r = multiexp(
+        srs.g_positive_x_alpha[(srs.d - 3*n - 1)..].iter(),
+        wires.c.iter().rev()
+            .chain_ext(wires.b.iter().rev())
+            .chain_ext(Some(E::Fr::zero()).iter())
+            .chain_ext(wires.a.iter()),
     ).into_affine();
 
-    // We're also going to evaluate it normally but shifted
-    // right by d, so we can demonstrate they're strictly negative
-    // exponents.
-    proof.a2 = multiexp(
-        srs.g_positive_x[srs.d - (2 * n)..srs.d].iter(),
-        wires.b.iter().chain_ext(wires.c.iter()).rev(),
-    ).into_affine();
+    transcript.commit_point(&r);
 
-    // Send ComR, R_2, A_2 to verifier
-    transcript.commit_point(&proof.com_r);
-    transcript.commit_point(&proof.com_r_prime);
-    transcript.commit_point(&proof.r2);
-    transcript.commit_point(&proof.a2);
+    let y: E::Fr = transcript.get_challenge_scalar();
 
-    // Sample y from the verifier
-    let y = transcript.get_challenge_scalar::<E::Fr>();
+    let mut rx1 = wires.b;
+    rx1.extend(wires.c);
+    rx1.reverse();
+    rx1.push(E::Fr::zero());
+    rx1.extend(wires.a);
 
-    // Let's compute r1(X, y)
-    let mut r1xy = wires.a.clone();
+    let mut rxy = rx1.clone();
+    let y_inv = y.inverse().unwrap(); // TODO
+    let mut tmp = y.pow(&[n as u64]);
+
+    for rxy in rxy.iter_mut().rev() {
+        rxy.mul_assign(&tmp);
+        tmp.mul_assign(&y_inv);
+    }
+
+    let (s_poly_negative, s_poly_positive) = {
+        let mut tmp = SxEval::new(y, n);
+        S::synthesize(&mut tmp, circuit).unwrap(); // TODO
+
+        tmp.poly()
+    };
+
+    let mut rxy_prime = rxy.clone();
     {
-        let mut tmp = y;
-        for coeff in &mut r1xy {
-            coeff.mul_assign(&tmp);
-            tmp.mul_assign(&y);
+        rxy_prime.resize(4 * n + 1, E::Fr::zero());
+        // Add s(x, y)
+        for (r, s) in rxy_prime[0..(2 * n)]
+            .iter_mut()
+            .rev()
+            .zip(s_poly_negative)
+        {
+            r.add_assign(&s);
+        }
+        for (r, s) in rxy_prime[(2 * n + 1)..].iter_mut().zip(s_poly_positive) {
+            r.add_assign(&s);
         }
     }
 
-    // Evaluate r1(x, y)
-    proof.r1 = multiexp(&srs.g_positive_x_alpha[0..n], &r1xy).into_affine();
-    proof.r1_prime = multiexp(&srs.h_positive_x_alpha[1..(n + 1)], &r1xy).into_affine();
+    let mut txy = multiply_polynomials::<E>(rx1.clone(), rxy_prime);
+    txy[4 * n] = E::Fr::zero(); // -k(y)
 
-    // Compute s(X, y)
-    let (s_poly_negative, s_poly_positive, k_y) = {
-        let mut s_eval = SEval::new(y, n);
-        circuit.synthesize(&mut s_eval)?;
-        s_eval.finalize()
-    };
-
-    // Evaluate s(x, y) in alpha
-    proof.s = multiexp(
-        srs.g_negative_x_alpha[0..n]
+    let t = multiexp(
+        srs.g_positive_x_alpha[0..(3 * n)]
             .iter()
-            .chain_ext(srs.g_positive_x_alpha[0..(2 * n)].iter()),
-        s_poly_negative.iter().chain_ext(s_poly_positive.iter()),
-    ).into_affine();
-
-    // Evaluate x^n s(x, y) so we can use Kate
-    proof.sx = multiexp(
-        srs.g_positive_x[0..(3 * n + 1)].iter(),
-        s_poly_negative
+            .chain_ext(srs.g_negative_x_alpha[0..(4 * n)].iter()),
+        txy[(4 * n + 1)..]
             .iter()
-            .rev()
-            .chain_ext(Some(&E::Fr::zero()))
-            .chain_ext(s_poly_positive.iter()),
+            .chain_ext(txy[0..4 * n].iter().rev()),
     ).into_affine();
 
-    proof.sx_prime = multiexp(
-        srs.h_positive_x[0..(3 * n + 1)].iter(),
-        s_poly_negative
-            .iter()
-            .rev()
-            .chain_ext(Some(&E::Fr::zero()))
-            .chain_ext(s_poly_positive.iter()),
-    ).into_affine();
+    transcript.commit_point(&t);
 
-    // Evaluate r1(x, y) with a shift so we can demonstrate it
-    // has no negative exponents
-    proof.a1 = multiexp(
-        srs.g_negative_x[srs.d - (n)..srs.d].iter(),
-        r1xy.iter().rev(),
-    ).into_affine();
+    let z: E::Fr = transcript.get_challenge_scalar();
+    let z_inv = z.inverse().unwrap(); // TODO
 
-    // Same thing, but shifting up
-    proof.rx = multiexp(
-        srs.g_positive_x_alpha[(srs.d - n)..(srs.d)].iter(),
-        r1xy.iter(),
-    ).into_affine();
+    // TODO: use the faster way to evaluate the polynomials
+    let mut rz = E::Fr::zero();
+    {
+        let mut tmp = z.pow(&[n as u64]);
 
-    // Send S, Sx, A1, R1, Rx to the verifier
-    transcript.commit_point(&proof.s);
-    transcript.commit_point(&proof.sx);
-    transcript.commit_point(&proof.sx_prime);
-    transcript.commit_point(&proof.a1);
-    transcript.commit_point(&proof.r1);
-    transcript.commit_point(&proof.r1_prime);
-    transcript.commit_point(&proof.rx);
+        for coeff in rx1.iter().rev() {
+            let mut coeff = *coeff;
+            coeff.mul_assign(&tmp);
+            rz.add_assign(&coeff);
+            tmp.mul_assign(&z_inv);
+        }
+    }
 
-    // Sample z from the verifier
-    let z = transcript.get_challenge_scalar::<E::Fr>();
+    let mut rzy = E::Fr::zero();
+    {
+        let mut tmp = z.pow(&[n as u64]);
 
-    // Make sure ComR and R1 have consistent coefficients
-    proof.comr_quotient = {
+        for mut coeff in rxy.into_iter().rev() {
+            coeff.mul_assign(&tmp);
+            rzy.add_assign(&coeff);
+            tmp.mul_assign(&z_inv);
+        }
+    }
+
+    transcript.commit_scalar(&rz);
+    transcript.commit_scalar(&rzy);
+
+    let r1: E::Fr = transcript.get_challenge_scalar();
+
+    let zy_opening = {
+        // r(X, 1) - r(z, y)
+        rx1[2 * n].sub_assign(&rzy);
+
         let mut point = y;
         point.mul_assign(&z);
         let poly = kate_divison(
-            Some(&E::Fr::zero()).into_iter().chain_ext(wires.a.iter()),
+            rx1.iter(),
             point,
         );
-        multiexp(&srs.g_positive_x[0..poly.len()], &poly[..]).into_affine()
+
+        let negative_poly = poly[0..2*n].iter().rev();
+        let positive_poly = poly[2*n..].iter();
+        multiexp(
+            srs.g_negative_x[1..(negative_poly.len() + 1)].iter().chain_ext(
+                srs.g_positive_x[0..positive_poly.len()].iter()
+            ),
+            negative_poly.chain_ext(positive_poly)
+        ).into_affine()
     };
 
-    proof.r1_quotient = {
-        let point = z;
-        let poly = kate_divison(
-            Some(&E::Fr::zero()).into_iter().chain_ext(r1xy.iter()),
-            point,
-        );
-        multiexp(&srs.g_positive_x[0..poly.len()], &poly[..]).into_affine()
-    };
+    let z_opening = {
+        rx1[2 * n].add_assign(&rzy); // restore
 
-    {
-        let mut yz = z;
-        yz.mul_assign(&y);
-        let mut tmp = yz;
-        for a in &wires.a {
-            let mut a = *a;
-            a.mul_assign(&tmp);
-
-            let av: &mut E::Fr = &mut proof.av;
-            av.add_assign(&a);
-
-            tmp.mul_assign(&yz);
+        for (t, &r) in txy[2 * n..].iter_mut().zip(rx1.iter()) {
+            let mut r = r;
+            r.mul_assign(&r1);
+            t.add_assign(&r);
         }
-    }
 
-    {
-        let mut tmp = E::Fr::one();
-        for s in s_poly_negative
-            .iter()
-            .rev()
-            .chain(Some(&E::Fr::zero()))
-            .chain(s_poly_positive.iter())
+        let mut val = E::Fr::zero();
         {
-            let mut s = *s;
-            s.mul_assign(&tmp);
+            assert_eq!(txy.len(), 3*n + 1 + 4*n);
+            let mut tmp = z.pow(&[(3*n) as u64]);
 
-            let sv: &mut E::Fr = &mut proof.sv;
-            sv.add_assign(&s);
-
-            tmp.mul_assign(&z);
-        }
-    }
-
-    proof.s_quotient = {
-        let poly = kate_divison(
-            s_poly_negative
-                .iter()
-                .rev()
-                .chain_ext(Some(&E::Fr::zero()))
-                .chain_ext(s_poly_positive.iter()),
-            z,
-        );
-        multiexp(&srs.g_positive_x[0..poly.len()], &poly).into_affine()
-    };
-
-    // Let's compute t(X, y)
-    let mut r_x_y = wires.b;
-    r_x_y.extend(wires.c);
-    r_x_y.reverse();
-    r_x_y.push(E::Fr::zero()); // constant term
-    r_x_y.extend(r1xy);
-    r_x_y.resize(4 * n + 1, E::Fr::zero());
-
-    let mut r_x_y_prime = r_x_y.clone();
-    // Add 2s(x, y)
-    for (r, mut s) in r_x_y_prime[0..(2 * n)]
-        .iter_mut()
-        .rev()
-        .zip(s_poly_negative)
-    {
-        s.double();
-        r.add_assign(&s);
-    }
-    for (r, mut s) in r_x_y_prime[(2 * n + 1)..].iter_mut().zip(s_poly_positive) {
-        s.double();
-        r.add_assign(&s);
-    }
-
-    // Evaluate r'(x, y) in G2, in alpha
-    proof.r_prime = multiexp(
-        srs.h_negative_x_alpha[(1)..(2 * n + 1)]
-            .iter()
-            .chain_ext(srs.h_positive_x_alpha[(1)..(2 * n + 1)].iter()),
-        r_x_y_prime[0..2 * n]
-            .iter()
-            .rev()
-            .chain_ext(r_x_y_prime[2 * n + 1..4 * n + 1].iter()),
-    ).into_affine();
-
-    let mut t_x_y = multiply_polynomials::<E>(r_x_y, r_x_y_prime);
-
-    assert_eq!(t_x_y.len(), 8 * n + 1);
-
-    // constant term should be 2*k_y
-    t_x_y[4 * n].sub_assign(&k_y);
-    t_x_y[4 * n].sub_assign(&k_y);
-    assert!(t_x_y[4 * n].is_zero());
-
-    // Evaluate t(x, y) in alpha
-    proof.t = multiexp(
-        srs.g_positive_x_alpha[0..(4 * n)]
-            .iter()
-            .chain_ext(srs.g_negative_x_alpha[0..(4 * n)].iter()),
-        t_x_y[(4 * n + 1)..]
-            .iter()
-            .chain_ext(t_x_y[0..4 * n].iter().rev()),
-    ).into_affine();
-
-    Ok(proof)
-}
-
-struct KYEval<E: Engine> {
-    y: E::Fr,
-
-    // current value of k(y)
-    k_y: E::Fr,
-
-    // current value of y^{N+q}
-    yqn: E::Fr,
-}
-
-impl<E: Engine> KYEval<E> {
-    fn new(y: E::Fr, n: usize) -> Self {
-        KYEval {
-            y: y,
-            k_y: E::Fr::zero(),
-            yqn: y.pow([(n + 1) as u64]),
-        }
-    }
-
-    /// Returns (s_negative, s_positive, k_y)
-    fn finalize(self) -> E::Fr {
-        self.k_y
-    }
-}
-
-impl<E: Engine> ConstraintSystem<E> for KYEval<E> {
-    fn multiply<F>(&mut self, _: F) -> Result<(Variable, Variable, Variable), SynthesisError>
-    where
-        F: FnOnce() -> Result<(E::Fr, E::Fr, E::Fr), SynthesisError>,
-    {
-        Ok((Variable::A(0), Variable::B(0), Variable::C(0)))
-    }
-
-    fn enforce(&mut self, _: LinearCombination<E>, mut right: E::Fr) {
-        // right will usually be 0 in practice :)
-        if !right.is_zero() {
-            right.mul_assign(&self.yqn);
-            self.k_y.add_assign(&right);
-        }
-
-        self.yqn.mul_assign(&self.y);
-    }
-
-    fn get_value(&self, _: Variable) -> Result<E::Fr, SynthesisError> {
-        Err(SynthesisError::AssignmentMissing)
-    }
-}
-
-struct SEval<E: Engine> {
-    y: E::Fr,
-
-    // current value of k(y)
-    k_y: E::Fr,
-    // current value of y^{N+q}
-    yqn: E::Fr,
-    // current value of y^i
-    yi: E::Fr,
-
-    // x^{-i} y^{-i} (\sum\limits_{q=1}^Q y^{q+N} u_{q,i})
-    u: Vec<E::Fr>,
-    // x^{i} (\sum\limits_{q=1}^Q y^{q+N} v_{q,i})
-    v: Vec<E::Fr>,
-    // x^{i+N} (-y^i + \sum\limits_{q=1}^Q y^{q+N} w_{q,i})
-    w: Vec<E::Fr>,
-}
-
-impl<E: Engine> SEval<E> {
-    fn new(y: E::Fr, n: usize) -> Self {
-        SEval {
-            y: y,
-
-            k_y: E::Fr::zero(),
-            yqn: y.pow([(n + 1) as u64]),
-            yi: y,
-
-            u: vec![],
-            v: vec![],
-            w: vec![],
-        }
-    }
-
-    /// Returns (s_negative, s_positive, k_y)
-    fn finalize(mut self) -> (Vec<E::Fr>, Vec<E::Fr>, E::Fr) {
-        let y_inv = self.y.inverse().unwrap();
-        let mut tmp = y_inv;
-        for u in &mut self.u {
-            u.mul_assign(&tmp);
-            tmp.mul_assign(&y_inv);
-        }
-
-        self.v.extend(self.w);
-
-        (self.u, self.v, self.k_y)
-    }
-}
-
-impl<E: Engine> ConstraintSystem<E> for SEval<E> {
-    fn multiply<F>(&mut self, _: F) -> Result<(Variable, Variable, Variable), SynthesisError>
-    where
-        F: FnOnce() -> Result<(E::Fr, E::Fr, E::Fr), SynthesisError>,
-    {
-        let index = self.u.len();
-
-        self.u.push(E::Fr::zero());
-        self.v.push(E::Fr::zero());
-
-        let mut negyi = self.yi;
-        negyi.negate();
-        self.w.push(negyi);
-
-        self.yi.mul_assign(&self.y);
-
-        Ok((Variable::A(index), Variable::B(index), Variable::C(index)))
-    }
-
-    fn enforce(&mut self, left: LinearCombination<E>, mut right: E::Fr) {
-        for (var, mut coeff) in left.0 {
-            coeff.mul_assign(&self.yqn);
-
-            match var {
-                Variable::A(index) => {
-                    self.u[index].add_assign(&coeff);
-                }
-                Variable::B(index) => {
-                    self.v[index].add_assign(&coeff);
-                }
-                Variable::C(index) => {
-                    self.w[index].add_assign(&coeff);
-                }
+            for coeff in txy.iter().rev() {
+                let mut coeff = *coeff;
+                coeff.mul_assign(&tmp);
+                val.add_assign(&coeff);
+                tmp.mul_assign(&z_inv);
             }
         }
 
-        // right will usually be 0 in practice :)
-        if !right.is_zero() {
-            right.mul_assign(&self.yqn);
-            self.k_y.add_assign(&right);
+        txy[4 * n].sub_assign(&val);
+
+        let poly = kate_divison(
+            txy.iter(),
+            z,
+        );
+
+        let negative_poly = poly[0..4*n].iter().rev();
+        let positive_poly = poly[4*n..].iter();
+        multiexp(
+            srs.g_negative_x[1..(negative_poly.len() + 1)].iter().chain_ext(
+                srs.g_positive_x[0..positive_poly.len()].iter()
+            ),
+            negative_poly.chain_ext(positive_poly)
+        ).into_affine()
+    };
+
+    Ok(Proof {
+        r, rz, rzy, t, z_opening, zy_opening
+    })
+}
+
+
+/*
+s(X, Y) =   \sum\limits_{i=1}^N \sum\limits_{q=1}^Q Y^{q+N} u_{i,q} X^{-i}
+          + \sum\limits_{i=1}^N \sum\limits_{q=1}^Q Y^{q+N} v_{i,q} X^{i}
+          + \sum\limits_{i=1}^N \sum\limits_{q=1}^Q Y^{q+N} w_{i,q} X^{i+N}
+          - \sum\limits_{i=1}^N Y^i X^{i+N}
+          - \sum\limits_{i=1}^N Y^{-i} X^{i+N}
+*/
+struct SyEval<E: Engine> {
+    max_n: usize,
+    current_q: usize,
+
+    // x^{-1}, ..., x^{-N}
+    a: Vec<E::Fr>,
+
+    // x^1, ..., x^{N}
+    b: Vec<E::Fr>,
+
+    // x^{N+1}, ..., x^{2*N}
+    c: Vec<E::Fr>,
+
+    // coeffs for y^1, ..., y^{N+Q}
+    positive_coeffs: Vec<E::Fr>,
+
+    // coeffs for y^{-1}, y^{-2}, ..., y^{-N}
+    negative_coeffs: Vec<E::Fr>,
+}
+
+
+impl<E: Engine> SyEval<E> {
+    fn new(x: E::Fr, n: usize, q: usize) -> Self {
+        let xinv = x.inverse().unwrap();
+        let mut tmp = E::Fr::one();
+        let mut a = vec![E::Fr::zero(); n];
+        for a in &mut a {
+            tmp.mul_assign(&xinv); // tmp = x^{-i}
+            *a = tmp;
         }
 
+        let mut tmp = E::Fr::one();
+        let mut b = vec![E::Fr::zero(); n];
+        for b in &mut b {
+            tmp.mul_assign(&x); // tmp = x^{i}
+            *b = tmp;
+        }
+
+        let mut positive_coeffs = vec![E::Fr::zero(); n + q];
+        let mut negative_coeffs = vec![E::Fr::zero(); n];
+
+        let mut c = vec![E::Fr::zero(); n];
+        for ((c, positive_coeff), negative_coeff) in c.iter_mut().zip(&mut positive_coeffs).zip(&mut negative_coeffs) {
+            tmp.mul_assign(&x); // tmp = x^{i+N}
+            *c = tmp;
+
+            // - \sum\limits_{i=1}^N Y^i X^{i+N}
+            let mut tmp = tmp;
+            tmp.negate();
+            *positive_coeff = tmp;
+
+            // - \sum\limits_{i=1}^N Y^{-i} X^{i+N}
+            *negative_coeff = tmp;
+        }
+
+        SyEval {
+            a,
+            b,
+            c,
+            positive_coeffs,
+            negative_coeffs,
+            current_q: 0,
+            max_n: n,
+        }
+    }
+
+    fn poly(self) -> (Vec<E::Fr>, Vec<E::Fr>) {
+        (self.negative_coeffs, self.positive_coeffs)
+    }
+
+    fn finalize(self, y: E::Fr) -> E::Fr {
+        let mut acc = E::Fr::zero();
+
+        let mut tmp = y;
+        for mut coeff in self.positive_coeffs {
+            coeff.mul_assign(&tmp);
+            acc.add_assign(&coeff);
+            tmp.mul_assign(&y);
+        }
+        let yinv = y.inverse().unwrap(); // TODO
+        let mut tmp = yinv;
+        for mut coeff in self.negative_coeffs {
+            coeff.mul_assign(&tmp);
+            acc.add_assign(&coeff);
+            tmp.mul_assign(&yinv);
+        }
+
+        acc
+    }
+}
+
+impl<'a, E: Engine> Backend<E> for &'a mut SyEval<E> {
+    fn new_linear_constraint(&mut self) {
+        self.current_q += 1;
+    }
+
+    fn insert_coefficient(&mut self, var: Variable, coeff: Coeff<E>) {
+        match var {
+            Variable::A(index) => {
+                let index = index - 1;
+                // Y^{q+N} += X^{-i} * coeff
+                let mut tmp = self.a[index];
+                coeff.multiply(&mut tmp);
+                let yindex = self.current_q + self.max_n;
+                self.positive_coeffs[yindex - 1].add_assign(&tmp);
+            }
+            Variable::B(index) => {
+                let index = index - 1;
+                // Y^{q+N} += X^{i} * coeff
+                let mut tmp = self.b[index];
+                coeff.multiply(&mut tmp);
+                let yindex = self.current_q + self.max_n;
+                self.positive_coeffs[yindex - 1].add_assign(&tmp);
+            }
+            Variable::C(index) => {
+                let index = index - 1;
+                // Y^{q+N} += X^{i+N} * coeff
+                let mut tmp = self.c[index];
+                coeff.multiply(&mut tmp);
+                let yindex = self.current_q + self.max_n;
+                self.positive_coeffs[yindex - 1].add_assign(&tmp);
+            }
+        };
+    }
+}
+
+/*
+s(X, Y) =   \sum\limits_{i=1}^N u_i(Y) X^{-i}
+          + \sum\limits_{i=1}^N v_i(Y) X^{i}
+          + \sum\limits_{i=1}^N w_i(Y) X^{i+N}
+
+where
+
+    u_i(Y) =        \sum\limits_{q=1}^Q Y^{q+N} u_{i,q}
+    v_i(Y) =        \sum\limits_{q=1}^Q Y^{q+N} v_{i,q}
+    w_i(Y) = -Y^i + -Y^{-i} + \sum\limits_{q=1}^Q Y^{q+N} w_{i,q}
+
+*/
+#[derive(Clone)]
+struct SxEval<E: Engine> {
+    y: E::Fr,
+
+    // current value of y^{q+N}
+    yqn: E::Fr,
+
+    // x^{-i} (\sum\limits_{q=1}^Q y^{q+N} u_{q,i})
+    u: Vec<E::Fr>,
+    // x^{i} (\sum\limits_{q=1}^Q y^{q+N} v_{q,i})
+    v: Vec<E::Fr>,
+    // x^{i+N} (-y^i -y^{-i} + \sum\limits_{q=1}^Q y^{q+N} w_{q,i})
+    w: Vec<E::Fr>,
+}
+
+impl<E: Engine> SxEval<E> {
+    fn new(y: E::Fr, n: usize) -> Self {
+        let y_inv = y.inverse().unwrap(); // TODO
+
+        let yqn = y.pow(&[n as u64]);
+
+        let u = vec![E::Fr::zero(); n];
+        let v = vec![E::Fr::zero(); n];
+        let mut w = vec![E::Fr::zero(); n];
+
+        let mut tmp1 = y;
+        let mut tmp2 = y_inv;
+        for w in &mut w {
+            let mut new = tmp1;
+            new.add_assign(&tmp2);
+            new.negate();
+            *w = new;
+            tmp1.mul_assign(&y);
+            tmp2.mul_assign(&y_inv);
+        }
+
+        SxEval {
+            y,
+            yqn,
+            u,
+            v,
+            w,
+        }
+    }
+
+    fn poly(mut self) -> (Vec<E::Fr>, Vec<E::Fr>) {
+        self.v.extend(self.w);
+
+        (self.u, self.v)
+    }
+
+    fn finalize(self, x: E::Fr) -> E::Fr {
+        let x_inv = x.inverse().unwrap(); // TODO
+
+        let mut tmp = x_inv;
+
+        let mut acc = E::Fr::zero();
+        for mut u in self.u {
+            u.mul_assign(&tmp);
+            acc.add_assign(&u);
+            tmp.mul_assign(&x_inv);
+        }
+
+        let mut tmp = x;
+        for mut v in self.v {
+            v.mul_assign(&tmp);
+            acc.add_assign(&v);
+            tmp.mul_assign(&x);
+        }
+        for mut w in self.w {
+            w.mul_assign(&tmp);
+            acc.add_assign(&w);
+            tmp.mul_assign(&x);
+        }
+
+        acc
+    }
+}
+
+impl<'a, E: Engine> Backend<E> for &'a mut SxEval<E> {
+    fn new_linear_constraint(&mut self) {
         self.yqn.mul_assign(&self.y);
     }
 
-    fn get_value(&self, _: Variable) -> Result<E::Fr, SynthesisError> {
-        Err(SynthesisError::AssignmentMissing)
+    fn insert_coefficient(&mut self, var: Variable, coeff: Coeff<E>) {
+        let acc = match var {
+            Variable::A(index) => {
+                &mut self.u[index - 1]
+            }
+            Variable::B(index) => {
+                &mut self.v[index - 1]
+            }
+            Variable::C(index) => {
+                &mut self.w[index - 1]
+            }
+        };
+
+        match coeff {
+            Coeff::Zero => { },
+            Coeff::One => {
+                acc.add_assign(&self.yqn);
+            },
+            Coeff::NegativeOne => {
+                acc.sub_assign(&self.yqn);
+            },
+            Coeff::Full(mut val) => {
+                val.mul_assign(&self.yqn);
+                acc.add_assign(&val);
+            }
+        }
     }
 }
 
 #[test]
-fn circuit_test() {
-    /// Circuit tests knowledge of x such that
-    /// x^3 = r for given r.
-    struct MyCircuit<E: Engine> {
-        x: Option<E::Fr>,
-        r: E::Fr,
-    }
+fn my_fun_circuit_test() {
+    use pairing::bls12_381::{Bls12, Fr};
+    use pairing::PrimeField;
+    use super::*;
+    use crate::synthesis::Basic;
 
-    impl<E: Engine> Circuit<E> for MyCircuit<E> {
+    struct MyCircuit;
+
+    impl<E: Engine> Circuit<E> for MyCircuit {
         fn synthesize<CS: ConstraintSystem<E>>(&self, cs: &mut CS) -> Result<(), SynthesisError> {
-            let (xl, xr, x2) = cs.multiply(|| {
-                let x = self.x.get()?;
-
-                let mut x2 = x;
-                x2.square();
-
-                Ok((x, x, x2))
+            let (a, b, _) = cs.multiply(|| {
+                Ok((
+                    E::Fr::from_str("10").unwrap(),
+                    E::Fr::from_str("20").unwrap(),
+                    E::Fr::from_str("200").unwrap(),
+                ))
             })?;
 
-            cs.enforce(LinearCombination::<E>::from(xl) - xr, E::Fr::zero());
+            cs.enforce_zero(LinearCombination::from(a) + a - b);
 
-            let (a, b, x3) = cs.multiply(|| {
-                let x = self.x.get()?;
+            //let multiplier = cs.alloc_input(|| Ok(E::Fr::from_str("20").unwrap()))?;
 
-                let mut x2 = x;
-                x2.square();
-
-                let mut x3 = x2;
-                x3.mul_assign(&x);
-
-                Ok((x, x2, x3))
-            })?;
-
-            cs.enforce(LinearCombination::<E>::from(a) - xl, E::Fr::zero());
-            cs.enforce(LinearCombination::<E>::from(b) - x2, E::Fr::zero());
-            cs.enforce(LinearCombination::<E>::from(x3), self.r);
+            //cs.enforce_zero(LinearCombination::from(b) - multiplier);
 
             Ok(())
         }
     }
 
-    use util::OptionExt;
-    use pairing::PrimeField;
-    use pairing::bls12_381::{Bls12, Fr};
+    let srs = SRS::<Bls12>::new(
+        20,
+        Fr::from_str("22222").unwrap(),
+        Fr::from_str("33333333").unwrap(),
+    );
+    let proof = create_proof::<Bls12, _, Basic>(&MyCircuit, &srs).unwrap();
 
-    let srs_x = Fr::from_str("23923").unwrap();
-    let srs_alpha = Fr::from_str("23728792").unwrap();
-    let srs = SRS::<Bls12>::new(10, srs_x, srs_alpha);
-    let precomp = Precomp::new::<Bls12, _>(&MyCircuit {
-        x: None,
-        r: Fr::zero(),
-    }).unwrap();
-    // let prepared_srs = PreparedSRS::from_srs(&srs);
+    use std::time::{Instant};
+    let start = Instant::now();
+    let mut batch = MultiVerifier::<Bls12, _, Basic>::new(MyCircuit, &srs).unwrap();
 
-    let x = Fr::from_str("2").unwrap();
-    let mut x3 = x;
-    x3.square();
-    x3.mul_assign(&x);
+    for _ in 0..1 {
+        batch.add_proof(&proof, &[/*Fr::from_str("20").unwrap()*/], |_, _| None);
+    }
 
-    let proof = create_proof::<Bls12, _>(&MyCircuit { x: Some(x), r: x3 }, &srs).unwrap();
+    assert!(batch.check_all());
 
-    verify_proof::<Bls12, _>(&MyCircuit { x: None, r: x3 }, &srs, &proof, &precomp, false).unwrap();
-
-    // let r = Fr::from_str("3948349").unwrap();
-
-    // use std::time::Instant;
-    // let start = Instant::now();
-    // verify_proof_faster::<Bls12, _>(&MyCircuit { x: None, r: x3 }, &srs, &prepared_srs, &proof, &r).unwrap();
-    // let elapsed = start.elapsed();
-    // panic!("{:?}", elapsed);
+    let elapsed = start.elapsed();
+    println!("time to verify: {:?}", elapsed);
 }
