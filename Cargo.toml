@@ -9,7 +9,7 @@ version = "0.14"
 features = ["u128-support"]
 
 [dependencies]
-merlin = "0.2"
+merlin = "1"
 rand = "0.4"
 bellman = "*"
 
