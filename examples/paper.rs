@@ -225,8 +225,8 @@ fn main() {
             }
 
             sha256_block_no_padding(&mut *cs, &preimage)?;
-            sha256_block_no_padding(&mut *cs, &preimage)?;
-            sha256_block_no_padding(&mut *cs, &preimage)?;
+            // sha256_block_no_padding(&mut *cs, &preimage)?;
+            // sha256_block_no_padding(&mut *cs, &preimage)?;
             // sha256_block_no_padding(&mut *cs, &preimage)?;
 
             Ok(())
@@ -397,34 +397,39 @@ fn main() {
     }
 
     {
-        let samples: usize = 100;
+        type ChosenBackend = Permutation3;
 
-        const NUM_BITS: usize = 384;
+        let samples: usize = 5;
 
-        let params = sapling_crypto::jubjub::JubjubBls12::new();
-        let circuit = PedersenHashPreimageCircuit {
-            preimage: vec![Some(true); NUM_BITS],
-            params: &params
+        // const NUM_BITS: usize = 384;
+        // let params = sapling_crypto::jubjub::JubjubBls12::new();
+        // let circuit = PedersenHashPreimageCircuit {
+        //     preimage: vec![Some(true); NUM_BITS],
+        //     params: &params
+        // };
+
+        let circuit = SHA256PreimageCircuit {
+            preimage: vec![Some(true); 512],
         };
 
         println!("creating proof");
         let start = Instant::now();
-        let proof = create_proof::<Bls12, _, Basic>(&AdaptorCircuit(circuit.clone()), &srs).unwrap();
+        let proof = create_proof::<Bls12, _, ChosenBackend>(&AdaptorCircuit(circuit.clone()), &srs).unwrap();
         println!("done in {:?}", start.elapsed());
 
         println!("creating advice");
         let start = Instant::now();
-        let advice = create_advice::<Bls12, _, Basic>(&AdaptorCircuit(circuit.clone()), &proof, &srs);
+        let advice = create_advice::<Bls12, _, ChosenBackend>(&AdaptorCircuit(circuit.clone()), &proof, &srs);
         println!("done in {:?}", start.elapsed());
 
         println!("creating aggregate for {} proofs", samples);
         let start = Instant::now();
         let proofs: Vec<_> = (0..samples).map(|_| (proof.clone(), advice.clone())).collect();
-        let aggregate = create_aggregate::<Bls12, _, Basic>(&AdaptorCircuit(circuit.clone()), &proofs, &srs);
+        let aggregate = create_aggregate::<Bls12, _, ChosenBackend>(&AdaptorCircuit(circuit.clone()), &proofs, &srs);
         println!("done in {:?}", start.elapsed());
 
         {
-            let mut verifier = MultiVerifier::<Bls12, _, Basic>::new(AdaptorCircuit(circuit.clone()), &srs).unwrap();
+            let mut verifier = MultiVerifier::<Bls12, _, ChosenBackend>::new(AdaptorCircuit(circuit.clone()), &srs).unwrap();
             println!("verifying 1 proof without advice");
             let start = Instant::now();
             {
@@ -437,7 +442,7 @@ fn main() {
         }
 
         {
-            let mut verifier = MultiVerifier::<Bls12, _, Basic>::new(AdaptorCircuit(circuit.clone()), &srs).unwrap();
+            let mut verifier = MultiVerifier::<Bls12, _, ChosenBackend>::new(AdaptorCircuit(circuit.clone()), &srs).unwrap();
             println!("verifying {} proofs without advice", samples);
             let start = Instant::now();
             {
@@ -450,7 +455,7 @@ fn main() {
         }
         
         {
-            let mut verifier = MultiVerifier::<Bls12, _, Basic>::new(AdaptorCircuit(circuit.clone()), &srs).unwrap();
+            let mut verifier = MultiVerifier::<Bls12, _, ChosenBackend>::new(AdaptorCircuit(circuit.clone()), &srs).unwrap();
             println!("verifying 100 proofs with advice");
             let start = Instant::now();
             {

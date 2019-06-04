@@ -43,6 +43,10 @@ impl<E: Engine, C: Circuit<E>, S: SynthesisDriver> MultiVerifier<E, C, S> {
         }
 
         impl<'a, E: Engine> Backend<E> for &'a mut Preprocess<E> {
+            type LinearConstraintIndex = ();
+
+            fn get_for_q(&self, q: usize) -> Self::LinearConstraintIndex { () }
+
             fn new_k_power(&mut self, index: usize) {
                 self.k_map.push(index);
             }
@@ -53,6 +57,7 @@ impl<E: Engine, C: Circuit<E>, S: SynthesisDriver> MultiVerifier<E, C, S> {
 
             fn new_linear_constraint(&mut self) {
                 self.q += 1;
+                ()
             }
         }
 
@@ -287,12 +292,17 @@ pub fn create_aggregate<E: Engine, C: Circuit<E>, S: SynthesisDriver>(
         }
 
         impl<'a, E: Engine> Backend<E> for &'a mut CountN {
+            type LinearConstraintIndex = ();
+
+            fn get_for_q(&self, q: usize) -> Self::LinearConstraintIndex { () }
+
             fn new_multiplication_gate(&mut self) {
                 self.n += 1;
             }
 
             fn new_linear_constraint(&mut self) {
                 self.q += 1;
+                ()
             }
         }
 
@@ -486,6 +496,12 @@ pub fn create_advice<E: Engine, C: Circuit<E>, S: SynthesisDriver>(
         }
 
         impl<'a, E: Engine> Backend<E> for &'a mut CountN {
+            type LinearConstraintIndex = ();
+
+            fn new_linear_constraint(&mut self) -> Self::LinearConstraintIndex { () }
+
+            fn get_for_q(&self, q: usize) -> Self::LinearConstraintIndex { () }
+
             fn new_multiplication_gate(&mut self) {
                 self.n += 1;
             }
@@ -581,6 +597,14 @@ pub fn create_proof<E: Engine, C: Circuit<E>, S: SynthesisDriver>(
     }
 
     impl<'a, E: Engine> Backend<E> for &'a mut Wires<E> {
+        type LinearConstraintIndex = ();
+
+        fn new_linear_constraint(&mut self) -> Self::LinearConstraintIndex { () }
+
+        fn get_for_q(&self, q: usize) -> Self::LinearConstraintIndex {
+            ()
+        }
+
         fn new_multiplication_gate(&mut self) {
             self.a.push(E::Fr::zero());
             self.b.push(E::Fr::zero());
@@ -895,18 +919,25 @@ impl<E: Engine> SyEval<E> {
 }
 
 impl<'a, E: Engine> Backend<E> for &'a mut SyEval<E> {
-    fn new_linear_constraint(&mut self) {
+    type LinearConstraintIndex = usize;
+
+    fn new_linear_constraint(&mut self) -> usize {
         self.current_q += 1;
+        self.current_q
     }
 
-    fn insert_coefficient(&mut self, var: Variable, coeff: Coeff<E>) {
+    fn get_for_q(&self, q: usize) -> Self::LinearConstraintIndex {
+        q
+    }
+
+    fn insert_coefficient(&mut self, var: Variable, coeff: Coeff<E>, q: &usize) {
         match var {
             Variable::A(index) => {
                 let index = index - 1;
                 // Y^{q+N} += X^{-i} * coeff
                 let mut tmp = self.a[index];
                 coeff.multiply(&mut tmp);
-                let yindex = self.current_q + self.max_n;
+                let yindex = *q + self.max_n;
                 self.positive_coeffs[yindex - 1].add_assign(&tmp);
             }
             Variable::B(index) => {
@@ -914,7 +945,7 @@ impl<'a, E: Engine> Backend<E> for &'a mut SyEval<E> {
                 // Y^{q+N} += X^{i} * coeff
                 let mut tmp = self.b[index];
                 coeff.multiply(&mut tmp);
-                let yindex = self.current_q + self.max_n;
+                let yindex = *q + self.max_n;
                 self.positive_coeffs[yindex - 1].add_assign(&tmp);
             }
             Variable::C(index) => {
@@ -922,7 +953,7 @@ impl<'a, E: Engine> Backend<E> for &'a mut SyEval<E> {
                 // Y^{q+N} += X^{i+N} * coeff
                 let mut tmp = self.c[index];
                 coeff.multiply(&mut tmp);
-                let yindex = self.current_q + self.max_n;
+                let yindex = *q + self.max_n;
                 self.positive_coeffs[yindex - 1].add_assign(&tmp);
             }
         };
@@ -954,6 +985,8 @@ struct SxEval<E: Engine> {
     v: Vec<E::Fr>,
     // x^{i+N} (-y^i -y^{-i} + \sum\limits_{q=1}^Q y^{q+N} w_{q,i})
     w: Vec<E::Fr>,
+
+    max_n: usize,
 }
 
 impl<E: Engine> SxEval<E> {
@@ -983,6 +1016,8 @@ impl<E: Engine> SxEval<E> {
             u,
             v,
             w,
+
+            max_n: n
         }
     }
 
@@ -1021,11 +1056,18 @@ impl<E: Engine> SxEval<E> {
 }
 
 impl<'a, E: Engine> Backend<E> for &'a mut SxEval<E> {
-    fn new_linear_constraint(&mut self) {
+    type LinearConstraintIndex = E::Fr;
+
+    fn new_linear_constraint(&mut self) -> E::Fr {
         self.yqn.mul_assign(&self.y);
+        self.yqn
     }
 
-    fn insert_coefficient(&mut self, var: Variable, coeff: Coeff<E>) {
+    fn get_for_q(&self, q: usize) -> Self::LinearConstraintIndex {
+        self.y.pow(&[(self.max_n + q) as u64])
+    }
+
+    fn insert_coefficient(&mut self, var: Variable, coeff: Coeff<E>, y: &E::Fr) {
         let acc = match var {
             Variable::A(index) => {
                 &mut self.u[index - 1]
@@ -1041,13 +1083,13 @@ impl<'a, E: Engine> Backend<E> for &'a mut SxEval<E> {
         match coeff {
             Coeff::Zero => { },
             Coeff::One => {
-                acc.add_assign(&self.yqn);
+                acc.add_assign(&y);
             },
             Coeff::NegativeOne => {
-                acc.sub_assign(&self.yqn);
+                acc.sub_assign(&y);
             },
             Coeff::Full(mut val) => {
-                val.mul_assign(&self.yqn);
+                val.mul_assign(&y);
                 acc.add_assign(&val);
             }
         }
@@ -1059,7 +1101,7 @@ fn my_fun_circuit_test() {
     use pairing::bls12_381::{Bls12, Fr};
     use pairing::PrimeField;
     use super::*;
-    use crate::synthesis::Basic;
+    use crate::synthesis::*;
 
     struct MyCircuit;
 
@@ -1088,11 +1130,11 @@ fn my_fun_circuit_test() {
         Fr::from_str("22222").unwrap(),
         Fr::from_str("33333333").unwrap(),
     );
-    let proof = create_proof::<Bls12, _, Basic>(&MyCircuit, &srs).unwrap();
+    let proof = create_proof::<Bls12, _, Permutation3>(&MyCircuit, &srs).unwrap();
 
     use std::time::{Instant};
     let start = Instant::now();
-    let mut batch = MultiVerifier::<Bls12, _, Basic>::new(MyCircuit, &srs).unwrap();
+    let mut batch = MultiVerifier::<Bls12, _, Permutation3>::new(MyCircuit, &srs).unwrap();
 
     for _ in 0..1 {
         batch.add_proof(&proof, &[/*Fr::from_str("20").unwrap()*/], |_, _| None);

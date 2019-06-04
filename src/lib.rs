@@ -47,6 +47,16 @@ pub enum Variable {
     C(usize),
 }
 
+impl Variable {
+    fn get_index(&self) -> usize {
+        match *self {
+            Variable::A(index) => index,
+            Variable::B(index) => index,
+            Variable::C(index) => index,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Coeff<E: Engine> {
     Zero,
