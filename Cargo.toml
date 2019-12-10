@@ -11,7 +11,7 @@ features = ["u128-support"]
 [dependencies]
 merlin = "1"
 rand = "0.4"
-bellman = "*"
+bellman = "0.1.0"
 
 [dependencies.sapling-crypto]
 git = "https://github.com/zcash-hackworks/sapling-crypto"
